@@ -153,30 +153,33 @@ jobs:
 
           echo "DIST_REPO_TOKEN access OK"
 
-      - name: Checkout dist repository
-        uses: actions/checkout@v7
-        with:
-          repository: aitonic/gate-us-lite-dist
-          ref: main
-          token: ${{ secrets.DIST_REPO_TOKEN }}
-          path: gate-us-lite-dist
-
       - name: Publish generated YAML to dist repo
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DIST_REPO_TOKEN }}
         run: |
           set -euo pipefail
 
-          cp -- mihomo.yaml gate-us-lite-dist/mihomo.yaml
-          cd gate-us-lite-dist
+          dist_dir="$(mktemp -d)"
+          cd "$dist_dir"
+
+          git init -b "${DIST_BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${DIST_REPO}.git"
+
+          # Pull latest commit if remote branch already exists
+          if git fetch --depth=1 origin "${DIST_BRANCH}" 2>/dev/null; then
+            git reset --hard "origin/${DIST_BRANCH}"
+          fi
+
+          cp -- "$GITHUB_WORKSPACE/mihomo.yaml" mihomo.yaml
 
           git add -- mihomo.yaml
-
           if git diff --cached --quiet; then
             echo "mihomo.yaml unchanged in dist repo"
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "deploy"
-          git push origin HEAD:main
+          git push origin "HEAD:${DIST_BRANCH}"
