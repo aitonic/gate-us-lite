@@ -1,0 +1,113 @@
+name: Generate Mihomo US VPN list
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Offset from the top of the hour to reduce scheduler congestion.
+    - cron: "7,37 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: generate-mihomo-${{ github.event.repository.default_branch }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      MIHOMO_VERSION: v1.19.31
+      MIHOMO_SHA256: d4304c546c3cddcb6fafd4b4fddb0ba1a95ffa36606fda56d75db2e59ad24114
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Restore selector state
+        continue-on-error: true
+        uses: actions/cache@v6
+        with:
+          path: .state
+          key: gate-us-lite-state-${{ github.event.repository.default_branch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gate-us-lite-state-${{ github.event.repository.default_branch }}-
+
+      - name: Validate restored selector state
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sqlite3
+
+          path = Path(".state/state.sqlite3")
+          if not path.exists():
+              raise SystemExit(0)
+
+          try:
+              db = sqlite3.connect(path)
+              row = db.execute("PRAGMA quick_check").fetchone()
+              db.close()
+              if not row or row[0] != "ok":
+                  raise RuntimeError(f"sqlite quick_check={row!r}")
+          except Exception as exc:
+              print(f"::warning title=Selector state reset::{exc}")
+              path.unlink(missing_ok=True)
+          PY
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests -v
+          python -m compileall -q gate_us_lite tests
+
+      - name: Generate mihomo.yaml
+        env:
+          PUBLICVPNLIST_API_KEY: ${{ secrets.PUBLICVPNLIST_API_KEY }}
+          ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
+          PROXYCHECK_API_KEY: ${{ secrets.PROXYCHECK_API_KEY }}
+        run: |
+          python -m gate_us_lite \
+            --config config.toml \
+            --state .state/state.sqlite3 \
+            --output mihomo.yaml
+          test -s mihomo.yaml
+          grep -q '^proxies:' mihomo.yaml
+          grep -q '^proxy-groups:' mihomo.yaml
+          grep -q 'name: US-STABLE' mihomo.yaml
+
+      - name: Validate with Mihomo binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="mihomo-linux-amd64-v1-${MIHOMO_VERSION}.gz"
+          url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${asset}"
+          curl --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 15 --max-time 120 \
+            --output /tmp/mihomo.gz "$url"
+          echo "${MIHOMO_SHA256}  /tmp/mihomo.gz" | sha256sum --check --strict
+          gzip -dc /tmp/mihomo.gz > /tmp/mihomo
+          chmod +x /tmp/mihomo
+          /tmp/mihomo -v
+          /tmp/mihomo -t -f mihomo.yaml
+
+      - name: Commit generated YAML when changed
+        shell: bash
+        run: |
+          git add -- mihomo.yaml
+          if git diff --cached --quiet; then
+            echo "mihomo.yaml unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: refresh mihomo US VPN list"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"

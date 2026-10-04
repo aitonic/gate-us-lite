@@ -1,0 +1,63 @@
+[general]
+country = "US"
+preferred_limit = 3
+fallback_limit = 8
+timeout_seconds = 20
+max_candidates_for_intel = 30
+
+# Full OVPN profile materialization is bounded so one slow secondary source cannot
+# consume the entire scheduled Actions job.
+publicvpnlist_materialize_limit = 40
+secondary_source_materialize_limit = 40
+vpnbook_host_limit = 4
+profile_fetch_timeout_seconds = 8
+
+# PublicVPNList exposes technically checked freshness. Only records checked within
+# the previous 24 hours are considered for materialization.
+publicvpnlist_fresh_within_seconds = 86400
+
+# Successful IP intelligence can be reused for one day. An ipwho failure is only
+# cached briefly so a transient outage cannot poison selection for 24 hours.
+intel_cache_ttl_seconds = 86400
+intel_error_cache_ttl_seconds = 900
+
+# Intelligence calls are deliberately budgeted. With three providers configured,
+# one slow provider must not consume the 12-minute GitHub Actions job.
+intel_request_timeout_seconds = 6
+intel_request_retries = 0
+intel_workers = 6
+
+# TCP reachability is a soft GitHub-runner signal, not an OpenVPN handshake.
+tcp_probe_limit = 40
+tcp_probe_timeout_seconds = 2.0
+
+# Protect the last-good source cache from abnormally small but technically
+# successful snapshots.
+source_baseline_window = 12
+source_low_watermark_ratio = 0.40
+source_low_watermark_min_baseline = 4
+
+[filters]
+max_ping_ms = 250
+min_speed_mbps = 0.5
+reject_hosting = true
+reject_tor = true
+# VPNGate is itself a public VPN, so generic proxy/VPN detection is a penalty,
+# not a hard reject.
+reject_proxy = false
+reject_residential_proxy = true
+reject_country_mismatch = true
+# Unknown IP intelligence is allowed in fallback, but cannot be promoted to
+# Preferred until ipwho returns a usable result.
+require_ipwho_for_preferred = true
+min_preferred_availability_24h = 0.25
+# Two consecutive TCP probe failures remove a TCP endpoint from Preferred, but it
+# can remain fallback.
+max_preferred_tcp_fail_streak = 2
+
+[sources]
+vpngate = true
+ipspeed = true
+vpnbook = true
+publicvpnlist = true
+vpngate_scraper = true
