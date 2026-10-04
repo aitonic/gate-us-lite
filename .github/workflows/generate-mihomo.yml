@@ -17,12 +17,15 @@ jobs:
   generate:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     env:
       MIHOMO_VERSION: v1.19.31
       MIHOMO_SHA256: d4304c546c3cddcb6fafd4b4fddb0ba1a95ffa36606fda56d75db2e59ad24114
+      DIST_REPO: aitonic/gate-us-lite-dist
+      DIST_BRANCH: main
 
     steps:
-      - name: Checkout default branch
+      - name: Checkout source repository
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -78,6 +81,7 @@ jobs:
             --config config.toml \
             --state .state/state.sqlite3 \
             --output mihomo.yaml
+
           test -s mihomo.yaml
           grep -q '^proxies:' mihomo.yaml
           grep -q '^proxy-groups:' mihomo.yaml
@@ -87,22 +91,73 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           asset="mihomo-linux-amd64-v1-${MIHOMO_VERSION}.gz"
           url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${asset}"
+
           curl --fail --location --silent --show-error \
             --retry 3 --retry-all-errors --retry-delay 2 \
             --connect-timeout 15 --max-time 120 \
             --output /tmp/mihomo.gz "$url"
+
           echo "${MIHOMO_SHA256}  /tmp/mihomo.gz" | sha256sum --check --strict
           gzip -dc /tmp/mihomo.gz > /tmp/mihomo
           chmod +x /tmp/mihomo
           /tmp/mihomo -v
           /tmp/mihomo -t -f mihomo.yaml
 
-      - name: Checkout public dist repo
+      - name: Commit generated YAML to source repo when changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -- mihomo.yaml
+
+          if git diff --cached --quiet; then
+            echo "mihomo.yaml unchanged in source repo"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: refresh mihomo US VPN list"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+
+      - name: Verify DIST_REPO_TOKEN
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DIST_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::DIST_REPO_TOKEN is missing"
+            exit 1
+          fi
+
+          status="$(
+            curl --silent --show-error \
+              --output /tmp/dist-repo.json \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${DIST_REPO}"
+          )"
+
+          if [ "$status" != "200" ]; then
+            echo "::error::DIST_REPO_TOKEN cannot access ${DIST_REPO} (HTTP ${status})"
+            cat /tmp/dist-repo.json
+            exit 1
+          fi
+
+          echo "DIST_REPO_TOKEN access OK"
+
+      - name: Checkout dist repository
         uses: actions/checkout@v7
         with:
           repository: aitonic/gate-us-lite-dist
+          ref: main
           token: ${{ secrets.DIST_REPO_TOKEN }}
           path: gate-us-lite-dist
 
@@ -110,14 +165,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cp -- mihomo.yaml gate-us-lite-dist/mihomo.yaml
           cd gate-us-lite-dist
+
           git add -- mihomo.yaml
+
           if git diff --cached --quiet; then
-            echo "dist mihomo.yaml unchanged"
+            echo "mihomo.yaml unchanged in dist repo"
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: refresh mihomo US VPN list"
-          git push
+          git commit -m "deploy"
+          git push origin HEAD:main
