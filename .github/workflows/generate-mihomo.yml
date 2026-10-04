@@ -99,19 +99,6 @@ jobs:
           /tmp/mihomo -v
           /tmp/mihomo -t -f mihomo.yaml
 
-      - name: Commit generated YAML when changed
-        shell: bash
-        run: |
-          git add -- mihomo.yaml
-          if git diff --cached --quiet; then
-            echo "mihomo.yaml unchanged"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: refresh mihomo US VPN list"
-          git push origin "HEAD:${{ github.event.repository.default_branch }}"
-
       - name: Checkout public dist repo
         uses: actions/checkout@v7
         with:
