@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from .intel import intel_known
 from .models import Candidate
 
 # Profile authority is explicit so merge output does not depend on thread completion order.
 SOURCE_PROFILE_PRIORITY = {
     "publicvpnlist": 50,
     "vpngate": 40,
-    "vpnbook": 35,
-    "ipspeed": 30,
     "vpngate_scraper": 20,
 }
 
@@ -97,8 +96,7 @@ def _checked_age_seconds(value: str) -> float | None:
 
 def rough_rank(c: Candidate) -> float:
     score = 0.0
-    families = set(c.evidence_families or [c.source_family])
-    if families.intersection({"vpnbook", "ipspeed"}):
+    if "ipspeed" in (c.evidence_families or [c.source_family]):
         score += 6
     if c.technical_score is not None:
         score += min(12, max(0.0, c.technical_score) * 0.12)
@@ -135,36 +133,38 @@ def rough_rank(c: Candidate) -> float:
     return score
 
 
-def _ipwho_known(i: dict) -> bool:
-    status = i.get("ipwho_status")
-    if status is not None:
-        return status == "ok"
-    # Compatibility for test fixtures and any pre-v0.4 in-memory payload.
-    return bool(i.get("country_code") or i.get("asn") or i.get("isp") or i.get("org"))
-
-
-def _hosting_known(i: dict) -> bool:
-    if "hosting_known" in i:
-        return bool(i.get("hosting_known"))
-    return _ipwho_known(i) or bool(i.get("hosting_heuristic"))
-
-
-def evaluate(c: Candidate, filters: dict) -> Candidate:
+def _reject_reasons(c: Candidate, filters: dict) -> list[str]:
+    """Safety and suitability checks shared by Preferred and Fallback; a node failing any is never published."""
     i = c.intel
-    h = c.history
     reasons: list[str] = []
     if i.get("invalid_ip"):
         reasons.append("invalid_ip")
-    if filters.get("reject_country_mismatch", True) and i.get("country_code") and i.get("country_code") != c.country_code:
+    elif filters.get("require_known_intel", True) and not intel_known(i):
+        reasons.append("intel_unknown")
+    if filters.get("reject_country_mismatch", True) and i.get("ipwho_status") == "ok" and i.get("country_code") != c.country_code:
         reasons.append("country_mismatch")
     if filters.get("reject_tor", True) and i.get("tor"):
         reasons.append("tor")
     if filters.get("reject_residential_proxy", True) and i.get("residential_proxy"):
         reasons.append("residential_proxy")
+    if filters.get("reject_hosting", True) and (i.get("hosting") or i.get("hosting_heuristic")):
+        reasons.append("hosting")
+    if filters.get("reject_proxy", True) and i.get("proxycheck_proxy"):
+        reasons.append("proxy")
+    risk = i.get("proxycheck_risk")
+    if risk is not None and risk > float(filters.get("max_proxycheck_risk", 25)):
+        reasons.append("high_risk")
     abuse = i.get("abuse_confidence")
     if abuse is not None and abuse >= 80:
         reasons.append("severe_recent_abuse")
-    c.reject_reasons = reasons
+    return reasons
+
+
+def evaluate(c: Candidate, filters: dict) -> Candidate:
+    i = c.intel
+    h = c.history
+    c.reject_reasons = _reject_reasons(c, filters)
+    abuse = i.get("abuse_confidence")
 
     score = rough_rank(c)
     a24 = h.get("availability_24h", 0.0)
@@ -173,14 +173,12 @@ def evaluate(c: Candidate, filters: dict) -> Candidate:
     if i.get("fixed_isp_heuristic"):
         score += 15
 
-    hosting_known = _hosting_known(i)
-    if hosting_known and not i.get("hosting") and not i.get("hosting_heuristic"):
-        score += 8
-    elif i.get("hosting") or i.get("hosting_heuristic"):
+    if i.get("hosting") or i.get("hosting_heuristic"):
         score -= 18
+    elif i.get("hosting_known"):
+        score += 8
     else:
-        # Unknown is not equivalent to clean. Keep it usable as fallback, but do not
-        # grant the clean residential/fixed-ISP bonus.
+        # Unknown is not equivalent to clean, so it never earns the clean bonus.
         score -= 6
 
     if i.get("proxycheck_proxy"):
@@ -205,13 +203,6 @@ def evaluate(c: Candidate, filters: dict) -> Candidate:
 
 def _preferred_ok(c: Candidate, filters: dict) -> bool:
     if c.reject_reasons:
-        return False
-    i = c.intel
-    if filters.get("require_ipwho_for_preferred", True) and not _ipwho_known(i):
-        return False
-    if filters.get("reject_hosting", True) and (i.get("hosting") or i.get("hosting_heuristic")):
-        return False
-    if filters.get("reject_proxy", False) and i.get("proxycheck_proxy"):
         return False
     if c.ping_ms is not None and c.ping_ms > float(filters.get("max_ping_ms", 250)):
         return False

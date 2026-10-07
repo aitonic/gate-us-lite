@@ -15,9 +15,11 @@ source-health protection
         ↓
 safe OVPN normalization
         ↓
-IP + stability evaluation
+real OpenVPN tunnel probe (local Mihomo, isolated job)
         ↓
-3 Preferred + up to 8 Fallback
+IP reputation hard rejects + stability ranking
+        ↓
+3 Preferred + up to 8 Fallback (only clean, known nodes)
         ↓
 mihomo.yaml
 ```
@@ -36,10 +38,8 @@ The project combines both while staying small.
 ## Current data sources
 
 1. **VPN Gate official API** — volunteer relay source.
-2. **IPSpeed** — independent OpenVPN list.
-3. **VPNBook** — official free OpenVPN endpoints.
-4. **PublicVPNList** — optional authenticated catalog with technical verification data.
-5. **Vpngate-Scraper-API** — recovery/mirror source, explicitly treated as the same VPNGate source family.
+2. **PublicVPNList** — optional authenticated catalog with technical verification data; records keep the family of their upstream source (VPN Gate, IPSpeed, ...).
+3. **Vpngate-Scraper-API** — recovery/mirror source, explicitly treated as the same VPNGate source family.
 
 The project tracks `source_family` so mirrors do not create fake source diversity.
 
@@ -49,7 +49,7 @@ The goal is **not** "pick the lowest ping every five minutes".
 
 The project prefers:
 
-- US endpoints;
+- US endpoints that complete a real OpenVPN handshake in the same run;
 - stable recent availability;
 - fixed-line ISP-like networks;
 - non-hosting/non-Tor/non-residential-proxy candidates;
@@ -93,20 +93,16 @@ Workflow:
 
 Runs:
 
-- every 30 minutes at minute 7 and 37;
+- every second day at 03:07 UTC (cron `7 3 */2 * *`);
 - manually via `workflow_dispatch`.
 
-Each run:
+Each run has three jobs (every job checks out the default branch and uses Python 3.13 and the pinned, checksum-verified Mihomo binary):
 
-1. checks out the default branch;
-2. uses Python 3.13;
-3. restores `.state` from Actions cache;
-4. runs all tests;
-5. generates `mihomo.yaml`;
-6. validates the generated configuration with a pinned real Mihomo binary in CI;
-7. commits only if `mihomo.yaml` changed.
+1. `collect`: runs all tests, restores `.state` from the Actions cache, fetches and merges the sources, pre-ranks the candidates and hands the pool (plus the state) to the next jobs as one-day artifacts;
+2. `probe`: dials the pool through real OpenVPN tunnels in a local Mihomo process. This is the only job that talks to untrusted VPN servers, and it has no secrets and no write token;
+3. `publish`: verifies the pool and state fingerprints, filters the verdicts, looks up IP intelligence for the observed exit addresses, selects nodes, generates `mihomo.yaml`, saves `.state` to the cache (only after the fingerprint check), validates the YAML with the pinned Mihomo binary, commits only if `mihomo.yaml` changed and pushes it to the dist repo.
 
-If generation cannot produce a safe node, the workflow fails and does **not** replace the previous YAML with an empty file.
+Better no node than a risky one: if no node survives the tunnel probe and every safety check, or the probe cannot run, the workflow fails and does **not** replace the previous YAML.
 
 ## Output
 
@@ -148,7 +144,7 @@ SQLite is runtime state only and is not intended to be committed.
 
 ## API keys
 
-All keys are optional for the overall generator:
+All keys are optional for the generator to start, but `PROXYCHECK_API_KEY` is effectively required to publish anything:
 
 ```text
 PUBLICVPNLIST_API_KEY
@@ -160,8 +156,9 @@ Behavior:
 
 - no PublicVPNList key -> PublicVPNList source is skipped;
 - no AbuseIPDB key -> abuse enrichment is skipped;
-- no ProxyCheck key -> ProxyCheck enrichment is skipped;
-- `ipwho.is` remains the zero-key baseline IP/ASN/ISP source.
+- no ProxyCheck key -> every address is unknown, and unknown nodes are never published (`require_known_intel`); `publish` stops with exit code 4 and an explicit message instead of silently producing nothing;
+- a ProxyCheck reply with a missing or null verdict is an error, so the address is unknown, never clean;
+- `ipwho.is` remains the zero-key baseline country/ASN/ISP source; its free tier carries no security verdicts.
 
 For scheduled long-term use, PublicVPNList permanent access is preferable to its 24-hour temporary key.
 
@@ -184,16 +181,19 @@ Supported embedded material currently includes:
 
 This boundary should remain strict.
 
+The tunnel probe makes an Actions runner dial untrusted public VPN servers. It runs in its own job with no secrets and a read-only token, and its Mihomo process gets a scrubbed environment. The publishing job checks the pool and state fingerprints and filters the verdicts it receives; third-party actions are pinned to commit SHAs, all HTTP requests are https only, and API keys are never forwarded to another origin. Residual risk: the probe job still holds the run's runtime token, so a compromised probe could in principle plant a forged Actions cache entry (artifacts are verified); GitHub's exact token scoping was not verified. Every node is a relay run by someone else: rely on end-to-end encryption (see the README trust model and the risk register in `HANDOFF.md`).
+
 ## Current validation state
 
-Re-verified for this handoff on 2026-10-02:
+Re-verified for this handoff on 2026-10-07:
 
 ```text
-30 unit tests: PASS
+107 unit tests: PASS (1 skipped when no Mihomo binary is available)
 compileall: PASS
+ruff (F,B,E9) and actionlint: clean
 ```
 
-Current tests cover source parsing, OVPN safety, source-aware availability, deterministic merge behavior, mirror-family evidence, Intel fail-open protection, bounded source materialization, TCP probe behavior, version consistency, selection behavior, and Mihomo rendering.
+Current tests cover source parsing, OVPN safety, source-aware availability, deterministic merge behavior, mirror-family evidence, Intel fail-open protection and provider mapping, bounded source materialization, TCP and tunnel probe behavior, `fetch` error reporting, version consistency, selection behavior, the workflow contract, and Mihomo rendering.
 
 ## Audit remediation status
 
@@ -203,7 +203,7 @@ The audit findings have been implemented in this revision:
 - availability denominators are source-aware and ignore `error` / `empty` / `degraded` runs as valid observation opportunities;
 - mirror provenance no longer creates fake independent-source score;
 - candidate merging is deterministic and source-priority driven;
-- unknown IP intelligence cannot enter Preferred; failed intelligence lookups use a short retry cache;
+- unknown, hosting, proxy/VPN, Tor, residential-proxy, high-risk or non-US exit addresses are never published; failed intelligence lookups use a short retry cache;
 - PublicVPNList uses bounded freshness and checked-tunnel measurements where available;
 - secondary source profile materialization is bounded by count and per-profile timeout;
 - OVPN keepalive fields are preserved as Mihomo `ping` / `ping-restart`;

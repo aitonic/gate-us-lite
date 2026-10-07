@@ -20,6 +20,65 @@ def _node_name(c: Candidate, tier: str, index: int) -> str:
     return f"US-{tier}{index:02d}-{isp}".replace(":", "-")
 
 
+def _proxy_lines(c: Candidate, name: str) -> list[str]:
+    p = c.profile
+    lines = [
+        f"  - name: {q(name)}",
+        "    type: openvpn",
+        f"    server: {q(p.server)}",
+        f"    port: {p.port}",
+        f"    proto: {p.proto}",
+        f"    udp: {'true' if p.proto == 'udp' else 'false'}",
+    ]
+    if p.username:
+        lines += [f"    username: {q(p.username)}", f"    password: {q(p.password)}"]
+    pem(lines, "ca", p.ca)
+    if p.cert and p.key:
+        pem(lines, "cert", p.cert)
+        pem(lines, "key", p.key)
+    if p.cipher:
+        lines.append(f"    cipher: {p.cipher}")
+    if p.auth:
+        lines.append(f"    auth: {p.auth}")
+    if p.data_ciphers:
+        lines.append("    data-ciphers: [" + ", ".join(p.data_ciphers) + "]")
+        if p.cipher:
+            lines.append(f"    data-ciphers-fallback: {p.cipher}")
+    if p.tls_auth:
+        pem(lines, "tls-auth", p.tls_auth)
+        if p.key_direction:
+            lines.append(f"    key-direction: {q(p.key_direction)}")
+    if p.tls_crypt:
+        pem(lines, "tls-crypt", p.tls_crypt)
+    if p.tls_crypt_v2:
+        pem(lines, "tls-crypt-v2", p.tls_crypt_v2)
+    if p.comp_lzo:
+        lines.append(f"    comp-lzo: {q(p.comp_lzo)}")
+    if p.ping:
+        lines.append(f"    ping: {p.ping}")
+    if p.ping_restart:
+        lines.append(f"    ping-restart: {p.ping_restart}")
+    return lines
+
+
+def render_probe_config(candidates: list[Candidate], ports: list[int], direct_port: int) -> str:
+    """Loopback listeners that each pin their traffic to one candidate, plus a DIRECT control listener."""
+    names = [f"probe-{i}" for i in range(len(candidates))]
+    lines = ["log-level: warning", "ipv6: false", "proxies:"]
+    for c, name in zip(candidates, names):
+        lines += _proxy_lines(c, name)
+    lines.append("listeners:")
+    for i, (proxy, port) in enumerate([("DIRECT", direct_port), *zip(names, ports)]):
+        lines += [
+            f"  - name: in-{i}",
+            "    type: mixed",
+            "    listen: 127.0.0.1",
+            f"    port: {port}",
+            f"    proxy: {q(proxy)}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
 def render(preferred: list[Candidate], fallback: list[Candidate]) -> str:
     if not preferred and not fallback:
         raise ValueError("cannot render Mihomo YAML without nodes")
@@ -37,48 +96,7 @@ def render(preferred: list[Candidate], fallback: list[Candidate]) -> str:
         names.append((c, _node_name(c, "B", idx)))
 
     for c, name in names:
-        p = c.profile
-        lines += [
-            f"  - name: {q(name)}",
-            "    type: openvpn",
-            f"    server: {q(p.server)}",
-            f"    port: {p.port}",
-            f"    proto: {p.proto}",
-            f"    udp: {'true' if p.proto == 'udp' else 'false'}",
-        ]
-        if p.username:
-            lines += [f"    username: {q(p.username)}", f"    password: {q(p.password)}"]
-        pem(lines, "ca", p.ca)
-        if p.cert and p.key:
-            pem(lines, "cert", p.cert)
-            pem(lines, "key", p.key)
-        if p.cipher:
-            lines.append(f"    cipher: {p.cipher}")
-        if p.auth:
-            lines.append(f"    auth: {p.auth}")
-        if p.data_ciphers:
-            lines.append("    data-ciphers: [" + ", ".join(p.data_ciphers) + "]")
-            if p.cipher:
-                lines.append(f"    data-ciphers-fallback: {p.cipher}")
-        if p.tls_auth:
-            pem(lines, "tls-auth", p.tls_auth)
-            if p.key_direction:
-                lines.append(f"    key-direction: {q(p.key_direction)}")
-        if p.tls_crypt:
-            pem(lines, "tls-crypt", p.tls_crypt)
-        if p.tls_crypt_v2:
-            pem(lines, "tls-crypt-v2", p.tls_crypt_v2)
-        if p.comp_lzo:
-            lines.append(f"    comp-lzo: {q(p.comp_lzo)}")
-        if p.ping:
-            lines.append(f"    ping: {p.ping}")
-        if p.ping_restart:
-            lines.append(f"    ping-restart: {p.ping_restart}")
-        families = ",".join(sorted(set(c.evidence_families or [c.source_family])))
-        lines += [
-            f"    # source={c.source} families={families} ip={c.ip_for_intel} score={c.selection_score}",
-            "",
-        ]
+        lines += [*_proxy_lines(c, name), ""]
 
     pnames = [name for c, name in names if c in preferred]
     all_names = [name for _, name in names]

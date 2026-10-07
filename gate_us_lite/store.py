@@ -6,7 +6,7 @@ import statistics
 import time
 from pathlib import Path
 from .models import Candidate, candidate_to_dict, candidate_from_dict
-from .intel import INTEL_SCHEMA
+from .intel import INTEL_SCHEMA, intel_known
 
 SOURCE_CACHE_SCHEMA = 3
 
@@ -238,7 +238,7 @@ class Store:
         )
         self.db.commit()
 
-    def cached_candidates(self, source: str, max_age: int = 86400) -> list[Candidate]:
+    def cached_candidates(self, source: str, max_age: int) -> list[Candidate]:
         row = self.db.execute(
             "SELECT fetched_at,payload,schema_version FROM source_cache WHERE source=?", (source,)
         ).fetchone()
@@ -271,7 +271,7 @@ class Store:
         payload = json.loads(row[1])
         if int(payload.get("intel_schema") or 0) != INTEL_SCHEMA:
             return None
-        effective_ttl = ttl if payload.get("ipwho_status") == "ok" else error_ttl
+        effective_ttl = ttl if intel_known(payload) else error_ttl
         if int(time.time()) - int(row[0]) > effective_ttl:
             return None
         return payload

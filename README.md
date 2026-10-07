@@ -8,12 +8,14 @@ There is no local service, daemon, systemd timer, Docker stack, HTTP/SOCKS proxy
 
 ```text
 VPN Gate ---------\
-IPSpeed -----------+--> source snapshot gate --> metadata pre-filter
-VPNBook -----------+             |                        |
-PublicVPNList -----+             +--> last-good cache     v
-VPNGate Scraper ---/                                safe OVPN parse
+PublicVPNList -----+--> source snapshot gate --> metadata pre-filter
+VPNGate Scraper ---/             |                        |
+                                 +--> last-good cache     v
+                                                    safe OVPN parse
                                                         |
                                                   TCP soft probe
+                                                        |
+                                              Mihomo tunnel probe
                                                         |
                                                IP quality + history
                                                         |
@@ -24,7 +26,9 @@ VPNGate Scraper ---/                                safe OVPN parse
                                                   mihomo.yaml
 ```
 
-The workflow runs every 30 minutes at minute `7` and `37`, and can also be started manually with **Actions -> Generate Mihomo US VPN list -> Run workflow**.
+The workflow runs every second day at 03:07 UTC (cron `7 3 */2 * *`; the day steps restart each month, so a 31-day month runs on the 31st and again on the 1st), and can also be started manually with **Actions -> Generate Mihomo US VPN list -> Run workflow**. It is split into three jobs (`collect` -> `probe` -> `publish`) so the process that dials untrusted VPN servers never sees a secret or a write token; see [GitHub Actions permission](#github-actions-permission).
+
+**Better no node than a risky one.** A node is published only if it completes a real OpenVPN handshake *and* ipwho.is plus ProxyCheck both returned a verdict for its observed exit address *and* that address is clean (not hosting, proxy/VPN, Tor, residential proxy, or above the risk limit). When no node qualifies the run fails and the previously committed `mihomo.yaml` stays in place.
 
 ## Output
 
@@ -50,12 +54,10 @@ The generator intentionally omits timestamps and changing quality scores from th
 Primary adapters:
 
 - **VPN Gate official API** -- direct volunteer relay source.
-- **IPSpeed** -- independent OpenVPN listings with uptime/ping metadata.
-- **VPNBook** -- stable US OpenVPN endpoints with credentials parsed at refresh time.
-- **PublicVPNList** -- optional verified/full-tunnel catalog.
+- **PublicVPNList** -- optional verified/full-tunnel catalog. Each record keeps the family of its upstream source (VPN Gate, IPSpeed, ...), so mirrors do not count as independent evidence.
 - **Vpngate-Scraper-API** -- VPNGate-family recovery source. It is tagged as the same `vpngate` source family so mirrors do not count as independent evidence.
 
-Source failures are isolated. Last successful per-source candidates are cached for 24 hours in `.state/state.sqlite3`, which is preserved between workflow runs with GitHub Actions cache. If no acceptable node can be produced, the workflow fails and leaves the previously committed `mihomo.yaml` untouched.
+Source failures are isolated. The last successful candidates of each source are kept for `source_cache_max_age_seconds` (4 days, so the stand-in outlives one missed run of the every-second-day schedule) in `.state/state.sqlite3`, which is preserved between workflow runs with GitHub Actions cache; they go through the same tunnel probe and address checks as fresh candidates. If no acceptable node can be produced, the workflow fails and leaves the previously committed `mihomo.yaml` untouched.
 
 ### Low-watermark protection
 
@@ -77,17 +79,33 @@ PublicVPNList can expose a much larger metadata catalog than the final selector 
 All keys are optional. Add them under **Settings -> Secrets and variables -> Actions** if available:
 
 - `PUBLICVPNLIST_API_KEY` -- enables the larger PublicVPNList verified pool.
-  PublicVPNList also offers short-lived 24-hour access keys; for unattended scheduled Actions, use permanent access when available. An expired key degrades only this source and does not invalidate last-good state.
-- `ABUSEIPDB_API_KEY` -- adds recent abuse reputation evidence.
-- `PROXYCHECK_API_KEY` -- adds proxy/VPN/risk evidence.
+  PublicVPNList also offers short-lived 24-hour access keys; for unattended scheduled Actions, use permanent access when available. An expired key (HTTP 401) degrades only this source and does not invalidate last-good state. When the key works but the source still yields nothing, the log names the stage that lost the records: `[warn] publicvpnlist: <records> records, <n> with a download link, 0 usable profiles (<reasons>)`. PublicVPNList documents `config_download_url` as nullable: some OpenVPN records are only reachable through a protected download page, and an unattended run cannot use those.
+- `ABUSEIPDB_API_KEY` -- adds recent abuse reputation evidence and an independent second opinion on hosting (usage type `Data Center/Web Hosting/Transit`) and Tor.
+- `PROXYCHECK_API_KEY` -- the only provider of Tor, proxy, risk and residential-proxy verdicts (and the authoritative hosting verdict). **Effectively required:** without a ProxyCheck verdict an exit address is unknown, and unknown is never published (`require_known_intel`). While the filter is on and the key is missing, `publish` stops with exit code 4 and an explicit message. A free ProxyCheck key allows 1,000 queries a day (its documented limit); one run looks up at most `max_candidates_for_intel` (30) addresses, far below that limit at one run every second day. A reply with a missing or null verdict counts as an error, never as clean.
 
-Without keys, the other sources and zero-key IP intelligence still work. If `PUBLICVPNLIST_API_KEY` is absent, that source is skipped cleanly.
+If `PUBLICVPNLIST_API_KEY` is absent, that source is skipped cleanly. Without `ABUSEIPDB_API_KEY` the abuse signal is simply missing.
 
 ## GitHub Actions permission
 
-The workflow uses the repository `GITHUB_TOKEN` with `contents: write` only so it can commit `mihomo.yaml`. If the repository or organization forces the token to read-only, allow GitHub Actions write access or adjust the branch/ruleset policy for this workflow. The workflow must be committed to the repository **default branch** for both scheduled and manual dispatch behavior.
+The workflow runs three jobs. A separate job is a separate VM, which is the only real isolation boundary GitHub Actions offers: steps of one job, and processes of one user, can read each other's environment and persist.
 
-The selector cache is optional: cache-restore failures do not block generation, and a corrupted restored SQLite database is detected with `PRAGMA quick_check` and reset automatically. IP-intelligence calls and the Mihomo binary download also have explicit wall-clock budgets so degraded external APIs cannot consume the entire 12-minute job.
+| Job | Does | Secrets | `GITHUB_TOKEN` |
+| --- | --- | --- | --- |
+| `collect` | tests, fetches the sources, merges, pre-ranks, TCP probe | `PUBLICVPNLIST_API_KEY` | `contents: read`, not persisted |
+| `probe` | dials the candidates through real OpenVPN tunnels in a local Mihomo | none | `contents: read`, not persisted |
+| `publish` | IP intelligence, selection, `mihomo -t`, commit to this repo, push to the dist repo | `ABUSEIPDB_API_KEY`, `PROXYCHECK_API_KEY`, `DIST_REPO_TOKEN` | `contents: write` |
+
+Jobs hand work over as one-day artifacts (`pool`, `state`, `verdicts`): `collect` uploads the candidate pool and the selector state, `probe` uploads its verdicts. `publish` verifies the pool and the state against SHA-256 values that `collect` exposed as job outputs, before it fetches the verdicts, and treats the verdicts as untrusted input: it keeps only entries that name a pooled candidate and carry a public exit address. The selector state is saved back to the Actions cache only after that check passed. If `probe` cannot deliver verdicts (Mihomo missing or not starting, no direct connectivity for the control request) the run fails with exit code 3 and nothing is published.
+
+Residual risk: the probe job still holds the run's runtime token, so a compromised probe job could in principle write artifacts or caches for this repository. It cannot reach secrets or push code, artifacts are verified by hash and verdicts are re-validated by `publish`. What it could still do is plant a forged Actions cache entry that a later `collect` run restores; since that cache holds selector history and intelligence, the realistic worst case is promoting a relay the attacker also operates. Signing the cache was considered and rejected: it needs another secret in a job that parses untrusted upstream data, and the state changes during `collect`, so `publish` could not verify a signature. How far GitHub scopes the runtime token has not been verified, so this is a strong reduction of the blast radius, not a guarantee.
+
+If the repository or organization forces the token to read-only, allow GitHub Actions write access or adjust the branch/ruleset policy for the `publish` job. The workflow must be committed to the repository **default branch** for both scheduled and manual dispatch behavior.
+
+The selector cache is optional: cache-restore failures do not block generation, and a corrupted restored SQLite database is detected with `PRAGMA quick_check` and reset automatically. The state is saved by `publish` even when no node is acceptable, so the intelligence cache survives failed runs. IP-intelligence calls, the tunnel probe and the Mihomo binary download also have explicit wall-clock budgets so degraded external APIs or dead nodes cannot consume a job.
+
+The pinned, checksum-verified Mihomo binary is installed by the local composite action `.github/actions/install-mihomo` in every job (tests and config validation in `collect`/`publish`, tunnel probe in `probe`). The probing Mihomo process additionally starts with a scrubbed environment.
+
+Third-party actions are pinned to full commit SHAs (the trailing comment names the release), so a moved tag cannot change what runs with the write token. A run that is already publishing is never cancelled half-way (`cancel-in-progress: false`); a newer run waits for it. All HTTP requests are `https` only, and request headers such as API keys are never forwarded to another origin by a redirect.
 
 The workflow intentionally has **no `pull_request` or `pull_request_target` trigger**, so untrusted pull-request code is never executed with the write token or repository secrets. See `CI-READINESS.md` for the complete preflight checklist.
 
@@ -100,13 +118,14 @@ The workflow intentionally has **no `pull_request` or `pull_request_target` trig
 5. Parse downloaded OpenVPN profiles with an allow-list. Script/plugin/management hooks and external file references are rejected rather than forwarded.
 6. Deduplicate by endpoint and preserve source-family provenance.
 7. Record **fresh observations only**. Cached recovery candidates may keep generation alive but never fake 1h/24h/7d availability.
-8. Run a cheap TCP connect probe on the top TCP candidates before expensive IP intelligence. It is only a soft GitHub-runner signal, not an OpenVPN handshake.
-9. Enrich only the top candidate set with IP/ASN/ISP/risk data.
-10. Reject severe cases such as Tor, residential-proxy signals, strong US geolocation mismatch, and severe recent abuse.
-11. Prefer fixed-line ISP-like networks, longer availability, good source measurements, successful TCP reachability, and ASN diversity.
-12. Two consecutive TCP probe failures keep a node out of Preferred but still allow it to remain fallback.
-13. Keep the previous primary first while it remains eligible.
-14. Atomically replace `mihomo.yaml` only after at least one acceptable node exists.
+8. Run a cheap TCP connect probe on the top TCP candidates. It is only a soft GitHub-runner signal that orders the candidates for the next step, not an OpenVPN handshake.
+9. Dial the top candidates (`tunnel_probe_limit`) through real OpenVPN tunnels in a local Mihomo process (the `probe` job). A candidate survives only if it completes the handshake and fetches the Cloudflare trace through the tunnel from a public exit address that differs from the runner's own. That exit address replaces the endpoint address in the lookups below. If the probe cannot run at all, nothing is published.
+10. Enrich only the surviving top candidates with ipwho.is (country, ASN, ISP), ProxyCheck (Tor, hosting, proxy/VPN, residential proxy, risk; detections of the last `proxycheck_lookback_days` days) and optionally AbuseIPDB (abuse score plus an independent hosting/Tor opinion).
+11. Reject, for Preferred **and** Fallback alike: unknown intelligence (`require_known_intel`; this includes a ProxyCheck reply with a missing or null verdict), invalid or non-US exit addresses, Tor, residential proxies, hosting/datacenter addresses (ProxyCheck or ISP keyword), proxy/VPN detections (`reject_proxy`), a ProxyCheck risk above `max_proxycheck_risk` (25, the top of ProxyCheck's documented "allow" band) and severe recent abuse.
+12. Rank the rest: fixed-line ISP-like networks, longer availability, good source measurements, successful TCP reachability, and ASN diversity.
+13. A node that is clean but slow, dead on TCP twice in a row, or rarely available is kept out of Preferred and may remain Fallback.
+14. Keep the previous primary first while it remains eligible.
+15. Atomically replace `mihomo.yaml` only after at least one acceptable node exists; otherwise exit with code 2 and keep the old file.
 
 ## State model
 
@@ -128,6 +147,10 @@ A residential/fiber ASN does **not** imply a private or clean residential IP. VP
 
 Destination services maintain private reputation systems, so this selector improves node quality but cannot guarantee that a site will accept any particular IP.
 
+### Trust model
+
+Every node is a relay run by someone else: VPN Gate volunteers, free VPN services, anonymous hosts. The relay operator can see which hosts you connect to and can read or alter whatever passes through unencrypted, DNS queries included; PublicVPNList says the same about its catalog ("Unknown third-party endpoints can still log or alter traffic; use end-to-end encryption and avoid sensitive accounts"). The filters above judge the **address** (hosting, proxy, Tor, risk, country) and that the tunnel really works; they say nothing about the honesty of the operator, and a clean verdict does not mean the address is not a public relay, only that none of the configured providers knows it as one. Treat the nodes as untrusted networks: rely on HTTPS/TLS/SSH end to end and keep credentials and sensitive accounts off them.
+
 ## Important configuration knobs
 
 ```toml
@@ -135,15 +158,26 @@ Destination services maintain private reputation systems, so this selector impro
 publicvpnlist_materialize_limit = 40
 tcp_probe_limit = 40
 tcp_probe_timeout_seconds = 2.0
+tunnel_probe_limit = 60
+tunnel_probe_timeout_seconds = 15
+proxycheck_lookback_days = 30
+source_cache_max_age_seconds = 345600
 source_baseline_window = 12
 source_low_watermark_ratio = 0.40
 source_low_watermark_min_baseline = 4
 
 [filters]
+require_known_intel = true
+reject_hosting = true
+reject_tor = true
+reject_proxy = true
+reject_residential_proxy = true
+reject_country_mismatch = true
+max_proxycheck_risk = 25
 max_preferred_tcp_fail_streak = 2
 ```
 
-The defaults are intentionally conservative and lightweight. Small sources such as VPNBook do not trigger the low-watermark rule because their normal baseline is below the minimum threshold.
+The defaults are intentionally conservative and lightweight. Sources whose normal baseline is below `source_low_watermark_min_baseline` do not trigger the low-watermark rule.
 
 ## Development check
 
@@ -160,4 +194,4 @@ To reproduce one workflow generation locally for development only:
 python -m gate_us_lite --config config.toml --state .state/state.sqlite3 --output mihomo.yaml
 ```
 
-This command is not required in normal use; the intended runtime is GitHub Actions.
+This command is not required in normal use; the intended runtime is GitHub Actions. It runs the stages the workflow runs as separate jobs (`collect`, `probe`, `finish`) in one process; each can also be run on its own (`python -m gate_us_lite probe --candidates handoff/candidates.json --verdicts handoff/verdicts.json`). The tunnel probe needs a Mihomo binary (`MIHOMO_BIN`, default `mihomo` on `PATH`) and direct connectivity; without it the command exits with code 3 and publishes nothing. Exit codes: `0` published, `2` no acceptable node, `3` tunnel probe unavailable, `4` configuration error (for example a missing `PROXYCHECK_API_KEY`).

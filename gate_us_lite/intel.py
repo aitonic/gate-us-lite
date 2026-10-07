@@ -5,7 +5,10 @@ import re
 import urllib.parse
 from .http import fetch
 
-INTEL_SCHEMA = 2
+INTEL_SCHEMA = 4
+
+ABUSE_HOSTING_USAGE = "Data Center/Web Hosting/Transit"
+PROXYCHECK_FLAGS = ("tor", "hosting", "anonymous")
 
 HOSTING_WORDS = {
     "amazon", "aws", "google cloud", "microsoft", "azure", "digitalocean", "vultr", "linode",
@@ -26,6 +29,11 @@ def is_public_ip(ip: str) -> bool:
         return False
 
 
+def intel_known(intel: dict) -> bool:
+    """True when both providers behind the selection verdicts answered for the address."""
+    return intel.get("ipwho_status") == "ok" and intel.get("proxycheck_status") == "ok"
+
+
 def _ipwho(ip: str, timeout: int, retries: int = 0) -> dict:
     p = fetch(
         f"https://ipwho.is/{urllib.parse.quote(ip)}",
@@ -34,34 +42,41 @@ def _ipwho(ip: str, timeout: int, retries: int = 0) -> dict:
     if not p.get("success", True):
         raise RuntimeError(p.get("message") or "ipwho.is failed")
     conn = p.get("connection") or {}
-    sec = p.get("security") or {}
     return {
         "country_code": (p.get("country_code") or "").upper(),
         "asn": conn.get("asn") or "",
         "isp": conn.get("isp") or "",
         "org": conn.get("org") or "",
         "domain": conn.get("domain") or "",
-        "proxy": bool(sec.get("proxy")),
-        "vpn": bool(sec.get("vpn")),
-        "tor": bool(sec.get("tor")),
-        "hosting": bool(sec.get("hosting")),
     }
 
 
-def _proxycheck(ip: str, key: str, timeout: int, retries: int = 0) -> dict:
-    q = urllib.parse.urlencode({"key": key, "vpn": "1", "risk": "1", "asn": "1"})
+def _proxycheck(ip: str, key: str, timeout: int, retries: int = 0, lookback_days: int = 0) -> dict:
+    """`lookback_days` widens how long ProxyCheck remembers a detection; 0 keeps its default window."""
+    params = {"key": key, **({"days": lookback_days} if lookback_days else {})}
     p = fetch(
-        f"https://proxycheck.io/v2/{urllib.parse.quote(ip)}?{q}",
+        f"https://proxycheck.io/v3/{urllib.parse.quote(ip)}?{urllib.parse.urlencode(params)}",
         timeout=timeout, retries=retries,
         max_bytes=500_000,
     ).json()
-    r = p.get(ip) or {}
-    typ = (r.get("type") or "").lower()
+    if p.get("status") not in ("ok", "warning"):
+        raise RuntimeError(p.get("message") or f"proxycheck status {p.get('status')}")
+    record = p.get(ip)
+    if not isinstance(record, dict):
+        raise RuntimeError("proxycheck returned no result for the address")
+    # A missing or null detection is "no data", never "clean": an incomplete verdict is an error.
+    detections = record.get("detections")
+    detections = detections if isinstance(detections, dict) else {}
+    risk = _num(detections.get("risk"))
+    if risk is None or not all(isinstance(detections.get(flag), bool) for flag in PROXYCHECK_FLAGS):
+        raise RuntimeError("proxycheck result lacks a complete verdict")
+    services = (record.get("operator") or {}).get("services") or []
     return {
-        "proxycheck_proxy": str(r.get("proxy", "")).lower() == "yes",
-        "proxycheck_type": typ,
-        "proxycheck_risk": _num(r.get("risk")),
-        "residential_proxy": "residential" in typ and "proxy" in typ,
+        "tor": detections["tor"],
+        "hosting": detections["hosting"] or (record.get("network") or {}).get("type") == "Hosting",
+        "proxycheck_proxy": detections["anonymous"],
+        "proxycheck_risk": risk,
+        "residential_proxy": "residential_proxies" in services,
     }
 
 
@@ -79,6 +94,8 @@ def _abuse(ip: str, key: str, timeout: int, retries: int = 0) -> dict:
         "abuse_confidence": _num(p.get("abuseConfidenceScore")),
         "abuse_reports_30d": int(p.get("totalReports") or 0),
         "abuse_last_reported": p.get("lastReportedAt") or "",
+        "abuse_usage_type": p.get("usageType") or "",
+        "abuse_tor": bool(p.get("isTor")),
     }
 
 
@@ -104,7 +121,7 @@ def _contains_keyword(text: str, words: set[str]) -> bool:
 
 def enrich(
     ip: str, *, timeout: int = 10, retries: int = 0,
-    proxycheck_key: str = "", abuseipdb_key: str = ""
+    proxycheck_key: str = "", abuseipdb_key: str = "", proxycheck_lookback_days: int = 0
 ) -> dict:
     if not is_public_ip(ip):
         return {
@@ -133,7 +150,7 @@ def enrich(
 
     if proxycheck_key:
         try:
-            out.update(_proxycheck(ip, proxycheck_key, timeout, retries))
+            out.update(_proxycheck(ip, proxycheck_key, timeout, retries, proxycheck_lookback_days))
             out["proxycheck_status"] = "ok"
         except Exception as exc:
             out["proxycheck_status"] = "error"
@@ -143,6 +160,9 @@ def enrich(
         try:
             out.update(_abuse(ip, abuseipdb_key, timeout, retries))
             out["abuse_status"] = "ok"
+            # A hosting or Tor verdict from either provider stands; the other one's silence never overrules it.
+            out["hosting"] = bool(out.get("hosting")) or out.get("abuse_usage_type") == ABUSE_HOSTING_USAGE
+            out["tor"] = bool(out.get("tor")) or bool(out.get("abuse_tor"))
         except Exception as exc:
             out["abuse_status"] = "error"
             out["abuse_error"] = str(exc)
@@ -153,9 +173,10 @@ def enrich(
     if text and _contains_keyword(text, RESIDENTIAL_WORDS):
         out["fixed_isp_heuristic"] = True
 
-    # `hosting=False` is meaningful only when the provider actually answered. If
-    # ipwho failed and no positive heuristic exists, hosting status stays unknown.
-    out["hosting_known"] = out.get("ipwho_status") == "ok" or bool(out.get("hosting_heuristic"))
+    # `hosting=False` is meaningful only when ProxyCheck evaluated the address.
+    # ipwho's free tier carries no hosting verdict, so without ProxyCheck the status
+    # stays unknown unless the keyword heuristic matched.
+    out["hosting_known"] = out["proxycheck_status"] == "ok" or bool(out.get("hosting_heuristic"))
 
     asn = str(out.get("asn") or "")
     out["asn_key"] = asn or text[:80] or ip

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .state/
+handoff/
 .env
 .venv/
 *.egg-info/

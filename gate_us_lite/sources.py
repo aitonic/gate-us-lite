@@ -2,22 +2,21 @@ from __future__ import annotations
 
 import base64
 import csv
-import html
 import math
 import re
 import socket
 import urllib.parse
 
-from .http import fetch
+from .http import FetchError, fetch
+from .log import tally
 from .models import Candidate
 from .ovpn import parse_ovpn
 
 VPNGATE_URL = "https://www.vpngate.net/api/iphone/"
-IPSPEED_URL = "https://ipspeed.info/free-openvpn.php"
-VPNBOOK_URL = "https://www.vpnbook.com/freevpn/openvpn"
 SCRAPER_README = "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/README.md"
 SCRAPER_BASE = "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/"
 PVL_API = "https://publicvpnlist.com/api/v1/servers"
+PVL_HOST = urllib.parse.urlsplit(PVL_API).hostname
 
 
 def _ip(host: str) -> str:
@@ -124,135 +123,28 @@ def vpngate(country: str = "US", timeout: int = 20) -> list[Candidate]:
     return out
 
 
-def ipspeed(
-    country: str = "US",
-    timeout: int = 20,
-    materialize_limit: int = 40,
-    profile_timeout: int = 8,
-) -> list[Candidate]:
-    page = fetch(IPSPEED_URL, timeout=timeout, retries=1).text()
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", page, re.I | re.S)
-    out: list[Candidate] = []
-    considered = 0
-    for row in rows:
-        plain = re.sub(r"<[^>]+>", " ", html.unescape(row))
-        if not re.search(r"\b(USA|United States)\b", plain, re.I):
-            continue
-        href_m = re.search(r'href=["\']([^"\']+\.ovpn[^"\']*)', row, re.I)
-        ip_m = re.search(r"\b((?:\d{1,3}\.){3}\d{1,3})\.ovpn\b", plain)
-        if not href_m or not ip_m:
-            continue
-        if considered >= max(1, int(materialize_limit)):
-            break
-        considered += 1
-        url = urllib.parse.urljoin(IPSPEED_URL, html.unescape(href_m.group(1)))
-        try:
-            conf = fetch(url, timeout=min(timeout, profile_timeout), retries=0, max_bytes=1_000_000).text()
-            p = parse_ovpn(conf, fallback_server=ip_m.group(1), username="vpn", password="vpn")
-        except Exception:
-            continue
-        up_m = re.search(r"(\d+)\s*day", plain, re.I)
-        ping_m = re.search(r"(\d+)\s*ms", plain, re.I)
-        out.append(Candidate(
-            source="ipspeed",
-            source_family="ipspeed",
-            source_id=ip_m.group(1),
-            country_code=country,
-            hostname="",
-            endpoint_ip=ip_m.group(1),
-            exit_ip=ip_m.group(1),
-            profile=p,
-            ping_ms=_float(ping_m.group(1)) if ping_m else None,
-            uptime_seconds=int(up_m.group(1)) * 86400 if up_m else None,
-            provenance=["ipspeed"],
-        ))
-    return out
-
-
-def _vpnbook_credentials(page: str) -> tuple[str, str]:
-    plain = re.sub(r"<[^>]+>", " ", html.unescape(page))
-    plain = re.sub(r"\s+", " ", plain)
-    um = re.search(r"Username\s+([A-Za-z0-9._-]+)", plain, re.I)
-    pm = re.search(r"Password\s+([A-Za-z0-9._-]+)", plain, re.I)
-    return (um.group(1) if um else "vpnbook", pm.group(1) if pm else "")
-
-
-def vpnbook(
-    country: str = "US",
-    timeout: int = 20,
-    host_limit: int = 4,
-    profile_timeout: int = 8,
-) -> list[Candidate]:
-    if country != "US":
-        return []
-    page = fetch(VPNBOOK_URL, timeout=timeout, retries=1).text()
-    username, password = _vpnbook_credentials(page)
-    if not password:
-        return []
-    hosts: list[str] = []
-    for host in re.findall(r"\b(us\d+\.vpnbook\.com)\b", page, re.I):
-        if host.lower() not in [h.lower() for h in hosts]:
-            hosts.append(host.lower())
-    out: list[Candidate] = []
-    for host in hosts[: max(1, int(host_limit))]:
-        short = host.split(".")[0]
-        filename = f"vpnbook-{short}-tcp443.ovpn"
-        urls = [
-            f"https://www.vpnbook.com/freevpn/openvpn/{filename}",
-            f"https://www.vpnbook.com/freevpn/openvpn/download/{filename}",
-            f"https://www.vpnbook.com/free-openvpn-account/{filename}",
-            f"https://www.vpnbook.com/free-openvpn-account/{filename}?download=1",
-            f"https://www.vpnbook.com/openvpn/{filename}",
-            f"https://www.vpnbook.com/{filename}",
-            f"https://www.vpnbook.com/freevpn/openvpn/download?server={short}&protocol=tcp443",
-            f"https://www.vpnbook.com/api/openvpn/config?server={short}&protocol=tcp443",
-        ]
-        conf = ""
-        for url in urls:
-            try:
-                text = fetch(url, timeout=min(timeout, profile_timeout), retries=0, max_bytes=1_000_000).text()
-                if re.search(r"(?mi)^\s*remote\s+\S+\s+\d+", text) and "<ca>" in text.lower():
-                    conf = text
-                    break
-            except Exception:
-                continue
-        if not conf:
-            continue
-        conf = re.sub(r"(?mi)^\s*remote\s+\S+\s+\d+(?:\s+\S+)?", f"remote {host} 443 tcp", conf, count=1)
-        conf = re.sub(r"(?mi)^\s*proto\s+\S+", "proto tcp", conf, count=1)
-        try:
-            p = parse_ovpn(conf, username=username, password=password)
-        except Exception:
-            continue
-        ep = _ip(host)
-        out.append(Candidate(
-            source="vpnbook",
-            source_family="vpnbook",
-            source_id=host,
-            country_code="US",
-            hostname=host,
-            endpoint_ip=ep,
-            exit_ip="",
-            profile=p,
-            provenance=["vpnbook"],
-        ))
-    return out
-
-
 def _pvl_source_family(r: dict) -> tuple[str, str]:
     raw = r.get("source") or r.get("source_name") or "publicvpnlist"
     if isinstance(raw, dict):
         raw = raw.get("name") or raw.get("slug") or raw.get("id") or "publicvpnlist"
     src = str(raw).lower()
-    if "vpngate" in src:
+    compact = re.sub(r"[^a-z0-9]", "", src)
+    if "vpngate" in compact:
         family = "vpngate"
-    elif "ipspeed" in src:
+    elif "ipspeed" in compact:
         family = "ipspeed"
-    elif "vpnbook" in src:
-        family = "vpnbook"
     else:
         family = src or "publicvpnlist"
     return src, family
+
+
+def _is_publicvpnlist(url: str) -> bool:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return host == PVL_HOST or host.endswith("." + PVL_HOST)
+
+
+def _failure_reason(exc: Exception) -> str:
+    return exc.reason if isinstance(exc, FetchError) else str(exc) or type(exc).__name__
 
 
 def _pvl_meta_rank(r: dict) -> float:
@@ -286,7 +178,8 @@ def publicvpnlist(
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     payload = fetch(PVL_API + "?" + q, headers=headers, timeout=timeout, retries=1, max_bytes=4_000_000).json()
 
-    rows = [r for r in payload.get("data", []) if r.get("config_download_url")]
+    records = payload.get("data", [])
+    rows = [r for r in records if r.get("config_download_url")]
     rows.sort(key=_pvl_meta_rank, reverse=True)
     selected: list[tuple[dict, str, str]] = []
     seen_meta: set[tuple[str, str]] = set()
@@ -302,16 +195,23 @@ def publicvpnlist(
             break
 
     out: list[Candidate] = []
+    failures: list[str] = []
     for r, src, family in selected:
         cfg_url = r.get("config_download_url")
         user = "vpn" if family in {"vpngate", "ipspeed"} else ""
         password = "vpn" if user else ""
         try:
-            conf = fetch(cfg_url, headers=headers, timeout=min(timeout, profile_timeout), retries=0, max_bytes=1_000_000).text()
+            # Download links come from the API response; the key is only ever sent to PublicVPNList itself.
+            conf = fetch(
+                cfg_url, headers=headers if _is_publicvpnlist(cfg_url) else None,
+                timeout=min(timeout, profile_timeout), retries=0, max_bytes=1_000_000,
+            ).text()
             p = parse_ovpn(conf, fallback_server=r.get("ip") or "", username=user, password=password)
-            if not (p.cert and p.key) and not p.username:
-                continue
-        except Exception:
+        except Exception as exc:
+            failures.append(_failure_reason(exc))
+            continue
+        if not (p.cert and p.key) and not p.username:
+            failures.append("profile without credentials")
             continue
         out.append(Candidate(
             source="publicvpnlist",
@@ -332,6 +232,12 @@ def publicvpnlist(
             https_first_byte_ms=_float(r.get("https_first_byte_ms")),
             provenance=[f"publicvpnlist:{src}"],
         ))
+    if records and not out:
+        reasons = tally(failures)
+        raise RuntimeError(
+            f"{len(records)} records, {len(rows)} with a download link, 0 usable profiles"
+            + (f" ({reasons})" if reasons else "")
+        )
     return out
 
 
@@ -341,10 +247,7 @@ def vpngate_scraper(
     materialize_limit: int = 40,
     profile_timeout: int = 8,
 ) -> list[Candidate]:
-    try:
-        readme = fetch(SCRAPER_README, timeout=timeout, retries=1, max_bytes=2_000_000).text()
-    except Exception:
-        return []
+    readme = fetch(SCRAPER_README, timeout=timeout, retries=1, max_bytes=2_000_000).text()
     out: list[Candidate] = []
     row_re = re.compile(r"^\|\s*([^|]+)\|\s*((?:\d{1,3}\.){3}\d{1,3})\s*\|\s*([^|]+)\|\s*([0-9.]+)\s*Mbps\s*\|\s*([^|]+)\|\s*\[[^\]]+\]\(([^)]+\.ovpn)\)\s*\|", re.M)
     considered = 0

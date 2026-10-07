@@ -3,41 +3,56 @@ name: Generate Mihomo US VPN list
 on:
   workflow_dispatch:
   schedule:
-    # Offset from the top of the hour to reduce scheduler congestion.
-    - cron: "7,37 * * * *"
+    # Every second day at 03:07 UTC; minute 7 keeps clear of the top-of-hour scheduler rush.
+    # The day steps restart each month, so a 31-day month runs on the 31st and again on the 1st.
+    - cron: "7 3 */2 * *"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: generate-mihomo-${{ github.event.repository.default_branch }}
-  cancel-in-progress: true
+  # A run that is already publishing is never interrupted half-way; a newer run waits for it.
+  cancel-in-progress: false
 
+env:
+  MIHOMO_BIN: /tmp/mihomo
+
+# The pipeline is split over three jobs so that the process dialing untrusted VPN
+# servers (probe) runs on its own VM without secrets or a write token:
+#   collect -> probe -> publish
+# Third-party actions are pinned to full commit SHAs (the trailing comment names the release).
 jobs:
-  generate:
+  collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-
-    env:
-      MIHOMO_VERSION: v1.19.31
-      MIHOMO_SHA256: d4304c546c3cddcb6fafd4b4fddb0ba1a95ffa36606fda56d75db2e59ad24114
-      DIST_REPO: aitonic/gate-us-lite-dist
-      DIST_BRANCH: main
+    timeout-minutes: 10
+    outputs:
+      candidates_sha256: ${{ steps.fingerprint.outputs.candidates }}
+      state_sha256: ${{ steps.fingerprint.outputs.state }}
 
     steps:
       - name: Checkout source repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
+      - name: Install pinned Mihomo
+        uses: ./.github/actions/install-mihomo
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests -v
+          python -m compileall -q gate_us_lite tests
+
       - name: Restore selector state
         continue-on-error: true
-        uses: actions/cache@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .state
           key: gate-us-lite-state-${{ github.event.repository.default_branch }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -66,20 +81,146 @@ jobs:
               path.unlink(missing_ok=True)
           PY
 
-      - name: Run tests
-        run: |
-          python -m unittest discover -s tests -v
-          python -m compileall -q gate_us_lite tests
-
-      - name: Generate mihomo.yaml
+      - name: Collect candidates
         env:
           PUBLICVPNLIST_API_KEY: ${{ secrets.PUBLICVPNLIST_API_KEY }}
+        run: |
+          python -m gate_us_lite collect \
+            --config config.toml \
+            --state .state/state.sqlite3 \
+            --candidates handoff/candidates.json
+
+      - name: Fingerprint handoff files
+        id: fingerprint
+        run: |
+          {
+            echo "candidates=$(sha256sum handoff/candidates.json | cut -d' ' -f1)"
+            echo "state=$(sha256sum .state/state.sqlite3 | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload candidate pool
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pool
+          path: handoff/candidates.json
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload selector state
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: state
+          path: .state/state.sqlite3
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  probe:
+    needs: collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Mihomo
+        uses: ./.github/actions/install-mihomo
+
+      - name: Download candidate pool
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pool
+          path: handoff
+
+      - name: Probe tunnels
+        run: |
+          python -m gate_us_lite probe \
+            --config config.toml \
+            --candidates handoff/candidates.json \
+            --verdicts handoff/verdicts.json
+
+      - name: Upload tunnel verdicts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verdicts
+          path: handoff/verdicts.json
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [collect, probe]
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    env:
+      DIST_REPO: aitonic/gate-us-lite-dist
+      DIST_BRANCH: main
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Mihomo
+        uses: ./.github/actions/install-mihomo
+
+      - name: Download candidate pool
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pool
+          path: handoff
+
+      - name: Download selector state
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: state
+          path: .state
+
+      - name: Verify handoff integrity
+        env:
+          CANDIDATES_SHA256: ${{ needs.collect.outputs.candidates_sha256 }}
+          STATE_SHA256: ${{ needs.collect.outputs.state_sha256 }}
+        run: |
+          printf '%s  %s\n' \
+            "$CANDIDATES_SHA256" handoff/candidates.json \
+            "$STATE_SHA256" .state/state.sqlite3 | sha256sum --check --strict
+
+      - name: Download tunnel verdicts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verdicts
+          path: handoff
+
+      - name: Generate mihomo.yaml
+        id: generate
+        env:
           ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
           PROXYCHECK_API_KEY: ${{ secrets.PROXYCHECK_API_KEY }}
         run: |
-          python -m gate_us_lite \
+          python -m gate_us_lite finish \
             --config config.toml \
             --state .state/state.sqlite3 \
+            --candidates handoff/candidates.json \
+            --verdicts handoff/verdicts.json \
             --output mihomo.yaml
 
           test -s mihomo.yaml
@@ -87,24 +228,17 @@ jobs:
           grep -q '^proxy-groups:' mihomo.yaml
           grep -q 'name: US-STABLE' mihomo.yaml
 
+      # Only state that passed the integrity check (and was therefore used by the step above) is persisted.
+      - name: Save selector state
+        if: ${{ !cancelled() && steps.generate.conclusion != 'skipped' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .state
+          key: gate-us-lite-state-${{ github.event.repository.default_branch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Validate with Mihomo binary
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          asset="mihomo-linux-amd64-v1-${MIHOMO_VERSION}.gz"
-          url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${asset}"
-
-          curl --fail --location --silent --show-error \
-            --retry 3 --retry-all-errors --retry-delay 2 \
-            --connect-timeout 15 --max-time 120 \
-            --output /tmp/mihomo.gz "$url"
-
-          echo "${MIHOMO_SHA256}  /tmp/mihomo.gz" | sha256sum --check --strict
-          gzip -dc /tmp/mihomo.gz > /tmp/mihomo
-          chmod +x /tmp/mihomo
-          /tmp/mihomo -v
-          /tmp/mihomo -t -f mihomo.yaml
+        run: $MIHOMO_BIN -t -f mihomo.yaml
 
       - name: Commit generated YAML to source repo when changed
         shell: bash

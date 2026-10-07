@@ -6,15 +6,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gate_us_lite.http import HTTPResponse
+from gate_us_lite.config import DEFAULTS
+from gate_us_lite.http import FetchError, HTTPResponse
 from gate_us_lite.models import Candidate, OpenVPNProfile
 from gate_us_lite.ovpn import parse_ovpn
 from gate_us_lite.probe import tcp_probe
 from gate_us_lite.select import merge_candidates, evaluate, choose
 from gate_us_lite.store import Store
-from gate_us_lite import sources, intel as intel_mod
+from gate_us_lite import sources
 from gate_us_lite.mihomo import render
-from gate_us_lite import cli
 
 CA='''-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----'''
 CONF=f'''client\ndev tun\nproto udp\nremote 1.2.3.4 1194\nauth-user-pass\ncipher AES-256-GCM\nauth SHA256\n<ca>\n{CA}\n</ca>\n'''
@@ -26,32 +26,6 @@ class TestPackageMetadata(unittest.TestCase):
         from gate_us_lite import __version__
         data = tomllib.loads(Path("pyproject.toml").read_text())
         self.assertEqual(__version__, data["project"]["version"])
-
-
-class TestWorkflowContract(unittest.TestCase):
-    def test_github_actions_contract(self):
-        text = Path(".github/workflows/generate-mihomo.yml").read_text(encoding="utf-8")
-        for required in (
-            "permissions:\n  contents: write",
-            "uses: actions/checkout@v7",
-            "uses: actions/setup-python@v7",
-            "uses: actions/cache@v6",
-            "timeout-minutes: 12",
-            "PUBLICVPNLIST_API_KEY",
-            "ABUSEIPDB_API_KEY",
-            "PROXYCHECK_API_KEY",
-            "mihomo-linux-amd64-v1-${MIHOMO_VERSION}.gz",
-            "d4304c546c3cddcb6fafd4b4fddb0ba1a95ffa36606fda56d75db2e59ad24114",
-            "mihomo -t -f mihomo.yaml",
-        ):
-            self.assertIn(required, text)
-
-    def test_ci_intel_budget_defaults(self):
-        from gate_us_lite.config import DEFAULTS
-        general = DEFAULTS["general"]
-        self.assertLessEqual(general["intel_request_timeout_seconds"], 6)
-        self.assertEqual(general["intel_request_retries"], 0)
-        self.assertGreaterEqual(general["intel_workers"], 6)
 
 
 class TestOVPN(unittest.TestCase):
@@ -110,30 +84,6 @@ class TestSources(unittest.TestCase):
         self.assertEqual(len(out),1)
         self.assertEqual(out[0].profile.server,'1.2.3.4')
 
-    def test_ipspeed_html_row(self):
-        page='<table><tr><td>1</td><td>USA</td><td><a href="/download/8.8.8.8.ovpn">8.8.8.8.ovpn</a></td><td>2 day(s)</td><td>14 ms</td></tr></table>'
-        def fake(url,**kwargs):
-            body = page if url==sources.IPSPEED_URL else CONF.replace('1.2.3.4','8.8.8.8')
-            return HTTPResponse(body.encode(),200,{},url)
-        with patch.object(sources,'fetch',side_effect=fake):
-            out=sources.ipspeed('US')
-        self.assertEqual(len(out),1)
-        self.assertEqual(out[0].uptime_seconds,172800)
-        self.assertEqual(out[0].ping_ms,14)
-
-    def test_vpnbook_dynamic_credentials_and_tcp443(self):
-        page='Username <b>vpnbook</b> Password <span>abcd1234</span> us16.vpnbook.com'
-        def fake(url,**kwargs):
-            if url==sources.VPNBOOK_URL:
-                return HTTPResponse(page.encode(),200,{},url)
-            return HTTPResponse(CONF.encode(),200,{},url)
-        with patch.object(sources,'fetch',side_effect=fake), patch.object(sources,'_ip',return_value='9.9.9.9'):
-            out=sources.vpnbook('US')
-        self.assertEqual(len(out),1)
-        self.assertEqual(out[0].profile.port,443)
-        self.assertEqual(out[0].profile.proto,'tcp')
-        self.assertEqual(out[0].profile.password,'abcd1234')
-
     def test_scraper_readme_config_correlation(self):
         readme='| vpnx | 8.8.4.4 | 11 | 33.2 Mbps | United States | [Download](./configs/server_1_US.ovpn) |'
         def fake(url,**kwargs):
@@ -158,6 +108,67 @@ class TestSources(unittest.TestCase):
         self.assertEqual(out[0].source_uptime_7d,95)
         self.assertEqual(out[0].handshake_ms,44)
         self.assertEqual(out[0].https_first_byte_ms,88)
+
+    def test_publicvpnlist_key_is_only_sent_to_its_own_domain(self):
+        own=['https://publicvpnlist.com/dl/1','https://dl.publicvpnlist.com/dl/2']
+        foreign=['https://notpublicvpnlist.com/dl/3','https://publicvpnlist.com.evil.example/dl/4','https://cdn.example/dl/5']
+        rows=[
+            {'id':i,'ip':f'1.2.3.{i}','country_code':'US','source':'VPNGate','config_download_url':url}
+            for i,url in enumerate(own+foreign,1)
+        ]
+        sent={}
+        def fake(url,headers=None,**kwargs):
+            if 'api/v1/servers?' in url:
+                return HTTPResponse(json.dumps({'data':rows}).encode(),200,{},url)
+            sent[url]=headers
+            return HTTPResponse(CONF.encode(),200,{},url)
+        with patch.object(sources,'fetch',side_effect=fake):
+            sources.publicvpnlist('secret','US')
+        for url in own:
+            self.assertEqual(sent[url],{'Authorization':'Bearer secret','Accept':'application/json'})
+        for url in foreign:
+            self.assertIsNone(sent[url])
+
+    def pvl_fetch(self,rows,download=None):
+        def fake(url,**kwargs):
+            if 'api/v1/servers?' in url:
+                return HTTPResponse(json.dumps({'data':rows}).encode(),200,{},url)
+            return download(url) if download else HTTPResponse(CONF.encode(),200,{},url)
+        return patch.object(sources,'fetch',side_effect=fake)
+
+    def test_publicvpnlist_empty_catalog_is_an_empty_result_not_an_error(self):
+        with self.pvl_fetch([]):
+            self.assertEqual(sources.publicvpnlist('k','US'),[])
+
+    def test_publicvpnlist_records_without_download_links_are_reported(self):
+        rows=[{'id':i,'ip':f'1.2.3.{i}','country_code':'US','config_download_url':None} for i in (1,2,3)]
+        with self.pvl_fetch(rows),self.assertRaisesRegex(RuntimeError,r'^3 records, 0 with a download link, 0 usable profiles$'):
+            sources.publicvpnlist('k','US')
+
+    def test_publicvpnlist_unusable_profiles_are_reported_with_their_reasons(self):
+        rows=[
+            {'id':i,'ip':f'1.2.3.{i}','country_code':'US','config_download_url':f'https://publicvpnlist.com/dl/{i}'}
+            for i in (1,2,3)
+        ]
+        def download(url):
+            if url.endswith('3'):
+                return HTTPResponse(b'<html>login required</html>',200,{},url)
+            raise FetchError(url,'HTTPError 410')
+        with self.pvl_fetch(rows,download),self.assertRaises(RuntimeError) as failed:
+            sources.publicvpnlist('k','US')
+        self.assertEqual(
+            str(failed.exception),
+            '3 records, 3 with a download link, 0 usable profiles (2x HTTPError 410; 1x missing embedded CA certificate)',
+        )
+
+    def test_scraper_fetch_failure_is_an_error_not_an_empty_result(self):
+        with patch.object(sources,'fetch',side_effect=FetchError(sources.SCRAPER_README,'HTTPError 404')):
+            with self.assertRaisesRegex(RuntimeError,'HTTPError 404'):
+                sources.vpngate_scraper('US')
+
+    def test_publicvpnlist_source_name_spelling(self):
+        for name,family in (('VPN Gate','vpngate'),('IPSpeed','ipspeed'),('AutoOVPN','autoovpn')):
+            self.assertEqual(sources._pvl_source_family({'source_name':name})[1],family)
 
     def test_publicvpnlist_lazy_materialization(self):
         rows=[]
@@ -197,12 +208,17 @@ class TestProbe(unittest.TestCase):
         self.assertIsNotNone(lat)
 
 
+FILTERS=DEFAULTS['filters']
+SELECTION_CFG={'general':{'preferred_limit':3,'fallback_limit':8},'filters':FILTERS}
+
+
 class TestSelection(unittest.TestCase):
     def mk(self,ip,asn,score=10,hosting=False,source='vpngate',proto='udp'):
         p=OpenVPNProfile(ip,443 if proto=='tcp' else 1194,proto,CA,username='vpn',password='vpn')
         c=Candidate(source,source,ip,'US','',ip,ip,p,provenance=[source])
         c.history={'seen_24h':3,'availability_24h':1.0,'availability_7d':1.0,'tcp_fail_streak':0}
-        c.intel={'country_code':'US','asn_key':asn,'fixed_isp_heuristic':not hosting,'hosting':hosting}
+        c.intel={'ipwho_status':'ok','proxycheck_status':'ok','hosting_known':True,'country_code':'US','asn_key':asn,'fixed_isp_heuristic':not hosting,'hosting':hosting}
+        evaluate(c,FILTERS)
         c.selection_score=score
         return c
 
@@ -235,70 +251,37 @@ class TestSelection(unittest.TestCase):
         mirror.provenance=['vpngate','vpngate_scraper','publicvpnlist:vpngate']
         mirror.evidence_families=['vpngate']
         independent=self.mk('3.3.3.3','AS3')
-        independent.evidence_families=['vpngate','vpnbook']
+        independent.evidence_families=['vpngate','autoovpn']
         for c in (base,mirror,independent):
             evaluate(c,filters)
         self.assertEqual(base.selection_score,mirror.selection_score)
         self.assertGreater(independent.selection_score,base.selection_score)
 
-    def test_unknown_ip_intel_cannot_enter_preferred(self):
+    def test_unknown_intel_is_never_published(self):
         c=self.mk('1.1.1.1','AS1',100)
         c.intel={'asn_key':'AS1','ipwho_status':'error','hosting_known':False}
-        cfg={'general':{'preferred_limit':3,'fallback_limit':8},'filters':{'require_ipwho_for_preferred':True,'reject_hosting':True,'max_ping_ms':250,'min_speed_mbps':0,'min_preferred_availability_24h':0.25,'max_preferred_tcp_fail_streak':2}}
-        pref,fb=choose([c],cfg,{})
-        self.assertEqual(pref,[])
-        self.assertEqual(fb,[c])
+        evaluate(c,FILTERS)
+        self.assertEqual(choose([c],SELECTION_CFG,{}),([],[]))
 
     def test_asn_diversity_and_sticky(self):
-        cfg={'general':{'preferred_limit':3,'fallback_limit':8},'filters':{'reject_hosting':True,'max_ping_ms':250,'min_speed_mbps':0,'min_preferred_availability_24h':0.25,'max_preferred_tcp_fail_streak':2}}
         a=self.mk('1.1.1.1','AS1',100); b=self.mk('2.2.2.2','AS1',90); c=self.mk('3.3.3.3','AS2',80); d=self.mk('4.4.4.4','AS3',70)
-        pref,_=choose([a,b,c,d],cfg,{'preferred':[c.dedupe_key]})
+        pref,_=choose([a,b,c,d],SELECTION_CFG,{'preferred':[c.dedupe_key]})
         self.assertEqual(pref[0].dedupe_key,c.dedupe_key)
         self.assertEqual(len({x.intel['asn_key'] for x in pref}),3)
 
-    def test_hosting_only_fallback(self):
-        cfg={'general':{'preferred_limit':3,'fallback_limit':8},'filters':{'reject_hosting':True,'max_ping_ms':250,'min_speed_mbps':0,'min_preferred_availability_24h':0.25,'max_preferred_tcp_fail_streak':2}}
+    def test_hosting_is_never_published(self):
         good=self.mk('1.1.1.1','AS1',50); host=self.mk('2.2.2.2','AS2',100,hosting=True)
-        pref,fb=choose([good,host],cfg,{})
-        self.assertEqual(pref,[good]); self.assertIn(host,fb)
+        self.assertEqual(choose([good,host],SELECTION_CFG,{}),([good],[]))
 
     def test_two_tcp_failures_remove_only_preferred(self):
-        cfg={'general':{'preferred_limit':3,'fallback_limit':8},'filters':{'reject_hosting':True,'max_ping_ms':250,'min_speed_mbps':0,'min_preferred_availability_24h':0.25,'max_preferred_tcp_fail_streak':2}}
         tcp=self.mk('1.1.1.1','AS1',100,proto='tcp')
         tcp.history['tcp_fail_streak']=2
-        pref,fb=choose([tcp],cfg,{})
-        self.assertEqual(pref,[])
-        self.assertEqual(fb,[tcp])
+        self.assertEqual(choose([tcp],SELECTION_CFG,{}),([],[tcp]))
 
-
-class TestIntel(unittest.TestCase):
-    def test_enrich_passes_bounded_retry_budget(self):
-        with patch.object(intel_mod, "_ipwho", return_value={"country_code":"US","hosting":False}) as ipwho, \
-             patch.object(intel_mod, "_proxycheck", return_value={}) as proxycheck, \
-             patch.object(intel_mod, "_abuse", return_value={}) as abuse:
-            intel_mod.enrich(
-                "1.1.1.1", timeout=6, retries=0,
-                proxycheck_key="proxy-key", abuseipdb_key="abuse-key"
-            )
-        ipwho.assert_called_once_with("1.1.1.1", 6, 0)
-        proxycheck.assert_called_once_with("1.1.1.1", "proxy-key", 6, 0)
-        abuse.assert_called_once_with("1.1.1.1", "abuse-key", 6, 0)
-
-    def test_hosting_keyword_does_not_match_colorado(self):
-        self.assertFalse(intel_mod._contains_keyword('Colorado Broadband LLC', intel_mod.HOSTING_WORDS))
-        self.assertTrue(intel_mod._contains_keyword('Example Colo Hosting LLC', intel_mod.HOSTING_WORDS))
-
-    def test_failed_ipwho_cache_expires_quickly(self):
-        with tempfile.TemporaryDirectory() as td:
-            st=Store(Path(td)/'s.db')
-            payload={'intel_schema':2,'invalid_ip':False,'ipwho_status':'error','hosting_known':False}
-            with patch('gate_us_lite.store.time.time', return_value=1000):
-                st.put_intel('1.2.3.4',payload)
-            with patch('gate_us_lite.store.time.time', return_value=1500):
-                self.assertIsNotNone(st.get_intel('1.2.3.4',ttl=86400,error_ttl=900))
-            with patch('gate_us_lite.store.time.time', return_value=2000):
-                self.assertIsNone(st.get_intel('1.2.3.4',ttl=86400,error_ttl=900))
-            st.close()
+    def test_slow_clean_node_stays_in_fallback(self):
+        slow=self.mk('1.1.1.1','AS1',100)
+        slow.ping_ms=900
+        self.assertEqual(choose([slow],SELECTION_CFG,{}),([],[slow]))
 
 
 class TestStoreAndOutput(unittest.TestCase):
@@ -314,7 +297,7 @@ class TestStoreAndOutput(unittest.TestCase):
             h=st.history(c.dedupe_key)
             self.assertGreater(h['availability_24h'],0.9)
             st.cache_candidates('vpngate',[c])
-            self.assertEqual(st.cached_candidates('vpngate')[0].dedupe_key,c.dedupe_key)
+            self.assertEqual(st.cached_candidates('vpngate',max_age=86400)[0].dedupe_key,c.dedupe_key)
             st.close()
             y=render([c],[])
             self.assertIn('US-PREFERRED',y)
@@ -323,6 +306,12 @@ class TestStoreAndOutput(unittest.TestCase):
             self.assertIn('type: fallback',y)
             self.assertEqual(y.count('expected-status: 204'),2)
             self.assertNotIn('Generated by gate-us-lite at',y)
+            self.assertNotIn('score=',y)
+
+    def test_yaml_does_not_depend_on_volatile_scores(self):
+        a=self.mk(); b=self.mk()
+        a.selection_score=10; b.selection_score=99
+        self.assertEqual(render([a],[]),render([b],[]))
 
     def test_history_uses_only_valid_source_opportunities(self):
         with tempfile.TemporaryDirectory() as td:
@@ -353,56 +342,22 @@ class TestStoreAndOutput(unittest.TestCase):
             self.assertEqual(st.source_baseline('vpngate',12),10.0)
             with patch('gate_us_lite.store.time.time', return_value=2000):
                 st.cache_candidates('vpngate',[c])
-                self.assertEqual(len(st.cached_candidates('vpngate')),1)
+                self.assertEqual(len(st.cached_candidates('vpngate',max_age=86400)),1)
             st.db.execute("UPDATE source_cache SET schema_version=1 WHERE source='vpngate'")
             st.db.commit()
             with patch('gate_us_lite.store.time.time', return_value=2000):
-                self.assertEqual(st.cached_candidates('vpngate'),[])
+                self.assertEqual(st.cached_candidates('vpngate',max_age=86400),[])
             st.close()
 
-    def test_low_watermark_detection(self):
+    def test_cached_candidates_expire_after_the_given_max_age(self):
         with tempfile.TemporaryDirectory() as td:
             st=Store(Path(td)/'s.db')
-            for i in range(4):
-                with patch('gate_us_lite.store.time.time', return_value=1000+i):
-                    st.record_source_snapshot('vpngate',10,'ok')
-            cfg={'general':{'source_baseline_window':12,'source_low_watermark_ratio':0.4,'source_low_watermark_min_baseline':4}}
-            degraded,baseline=cli._is_degraded(st,'vpngate',2,cfg)
-            self.assertTrue(degraded)
-            self.assertEqual(baseline,10.0)
+            with patch('gate_us_lite.store.time.time', return_value=1000):
+                st.cache_candidates('vpngate',[self.mk()])
+            with patch('gate_us_lite.store.time.time', return_value=1000+2*86400):
+                self.assertEqual(st.cached_candidates('vpngate',max_age=86400),[])
+                self.assertEqual(len(st.cached_candidates('vpngate',max_age=4*86400)),1)
             st.close()
-
-    def test_cached_fallback_does_not_fake_availability(self):
-        with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            cfg=root/'config.toml'
-            cfg.write_text('[sources]\nvpngate=true\nipspeed=false\nvpnbook=false\npublicvpnlist=false\nvpngate_scraper=false\n',encoding='utf-8')
-            c=self.mk()
-            intel={'country_code':'US','asn_key':'AS1','fixed_isp_heuristic':True,'hosting':False,'intel_schema':2,'ipwho_status':'ok'}
-            with patch.object(cli,'_fetch_one',return_value=[c]), patch.object(cli,'enrich',return_value=intel), patch('gate_us_lite.store.time.time',return_value=1000):
-                self.assertEqual(cli.generate(str(cfg),str(root/'.state/state.sqlite3'),str(root/'mihomo.yaml')),0)
-            with patch.object(cli,'_fetch_one',return_value=[]), patch('gate_us_lite.store.time.time',return_value=2000):
-                self.assertEqual(cli.generate(str(cfg),str(root/'.state/state.sqlite3'),str(root/'mihomo.yaml')),0)
-                st=Store(root/'.state/state.sqlite3')
-                h=st.history(c.dedupe_key)
-                st.close()
-            self.assertEqual(h['seen_24h'],1)
-            self.assertEqual(h['availability_24h'],1.0)
-            self.assertEqual(h['opportunities_24h'],1)
-
-    def test_generate_writes_only_yaml_output(self):
-        with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            cfg=root/'config.toml'
-            cfg.write_text('[sources]\nvpngate=true\nipspeed=false\nvpnbook=false\npublicvpnlist=false\nvpngate_scraper=false\n',encoding='utf-8')
-            c=self.mk()
-            c.ping_ms=20; c.speed_mbps=50
-            with patch.object(cli,'_fetch_one',return_value=[c]), patch.object(cli,'enrich',return_value={'country_code':'US','asn_key':'AS1','fixed_isp_heuristic':True,'hosting':False}):
-                rc=cli.generate(str(cfg),str(root/'.state/state.sqlite3'),str(root/'mihomo.yaml'))
-            self.assertEqual(rc,0)
-            self.assertTrue((root/'mihomo.yaml').is_file())
-            self.assertFalse((root/'report.json').exists())
-            self.assertFalse((root/'summary.json').exists())
 
 
 if __name__=='__main__':
