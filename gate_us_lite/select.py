@@ -145,14 +145,16 @@ def _reject_reasons(c: Candidate, filters: dict) -> list[str]:
         reasons.append("country_mismatch")
     if filters.get("reject_tor", True) and i.get("tor"):
         reasons.append("tor")
+    if filters.get("reject_compromised", True) and i.get("compromised"):
+        reasons.append("compromised")
     if filters.get("reject_residential_proxy", True) and i.get("residential_proxy"):
         reasons.append("residential_proxy")
-    if filters.get("reject_hosting", True) and (i.get("hosting") or i.get("hosting_heuristic")):
+    if filters.get("reject_hosting", False) and (i.get("hosting") or i.get("hosting_heuristic")):
         reasons.append("hosting")
-    if filters.get("reject_proxy", True) and i.get("proxycheck_proxy"):
+    if filters.get("reject_proxy", False) and i.get("proxycheck_proxy"):
         reasons.append("proxy")
     risk = i.get("proxycheck_risk")
-    if risk is not None and risk > float(filters.get("max_proxycheck_risk", 25)):
+    if risk is not None and risk > float(filters.get("max_proxycheck_risk", 100)):
         reasons.append("high_risk")
     abuse = i.get("abuse_confidence")
     if abuse is not None and abuse >= 80:

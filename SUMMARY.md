@@ -17,9 +17,9 @@ safe OVPN normalization
         ↓
 real OpenVPN tunnel probe (local Mihomo, isolated job)
         ↓
-IP reputation hard rejects + stability ranking
+dangerous-address hard rejects + stability ranking
         ↓
-3 Preferred + up to 8 Fallback (only clean, known nodes)
+3 Preferred + up to 8 Fallback (only nodes with a known, non-dangerous exit address)
         ↓
 mihomo.yaml
 ```
@@ -52,7 +52,7 @@ The project prefers:
 - US endpoints that complete a real OpenVPN handshake in the same run;
 - stable recent availability;
 - fixed-line ISP-like networks;
-- non-hosting/non-Tor/non-residential-proxy candidates;
+- non-Tor, non-compromised, non-residential-proxy candidates (hosting and known-VPN verdicts only lower the rank);
 - reasonable source speed/ping;
 - ASN diversity;
 - a previous primary that is still healthy.
@@ -102,7 +102,7 @@ Each run has three jobs (every job checks out the default branch and uses Python
 2. `probe`: dials the pool through real OpenVPN tunnels in a local Mihomo process. This is the only job that talks to untrusted VPN servers, and it has no secrets and no write token;
 3. `publish`: verifies the pool and state fingerprints, filters the verdicts, looks up IP intelligence for the observed exit addresses, selects nodes, generates `mihomo.yaml`, saves `.state` to the cache (only after the fingerprint check), validates the YAML with the pinned Mihomo binary, commits only if `mihomo.yaml` changed and pushes it to the dist repo.
 
-Better no node than a risky one: if no node survives the tunnel probe and every safety check, or the probe cannot run, the workflow fails and does **not** replace the previous YAML.
+Better no node than a dangerous one: if no node survives the tunnel probe and every safety check, or the probe cannot run, the workflow fails and does **not** replace the previous YAML.
 
 ## Output
 
@@ -188,7 +188,7 @@ The tunnel probe makes an Actions runner dial untrusted public VPN servers. It r
 Re-verified for this handoff on 2026-10-07:
 
 ```text
-107 unit tests: PASS (1 skipped when no Mihomo binary is available)
+110 unit tests: PASS (1 skipped when no Mihomo binary is available)
 compileall: PASS
 ruff (F,B,E9) and actionlint: clean
 ```
@@ -203,7 +203,7 @@ The audit findings have been implemented in this revision:
 - availability denominators are source-aware and ignore `error` / `empty` / `degraded` runs as valid observation opportunities;
 - mirror provenance no longer creates fake independent-source score;
 - candidate merging is deterministic and source-priority driven;
-- unknown, hosting, proxy/VPN, Tor, residential-proxy, high-risk or non-US exit addresses are never published; failed intelligence lookups use a short retry cache;
+- unknown, Tor, compromised-host, residential-proxy, severely abused or non-US exit addresses are never published (hosting, proxy/VPN and risk verdicts only lower the rank); failed intelligence lookups use a short retry cache;
 - PublicVPNList uses bounded freshness and checked-tunnel measurements where available;
 - secondary source profile materialization is bounded by count and per-profile timeout;
 - OVPN keepalive fields are preserved as Mihomo `ping` / `ping-restart`;

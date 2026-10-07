@@ -15,8 +15,8 @@ from tests.helpers import candidate
 CLEAN = {
     "intel_schema": intel_mod.INTEL_SCHEMA, "ipwho_status": "ok", "proxycheck_status": "ok",
     "country_code": "US", "asn_key": "AS1", "hosting_known": True, "hosting": False,
-    "proxycheck_proxy": False, "proxycheck_risk": 0.0, "tor": False, "residential_proxy": False,
-    "fixed_isp_heuristic": True,
+    "proxycheck_proxy": False, "proxycheck_risk": 0.0, "tor": False, "compromised": False,
+    "residential_proxy": False, "fixed_isp_heuristic": True,
 }
 VPNGATE_ONLY = "[sources]\nvpngate=true\npublicvpnlist=false\nvpngate_scraper=false\n"
 
@@ -93,17 +93,19 @@ class TestRun(PipelineCase):
             self.assertEqual(self.run_cli(), 2)
         self.assertFalse(self.output.exists())
 
-    def test_risky_exit_addresses_are_dropped_and_clean_ones_kept(self):
+    def test_dangerous_exit_addresses_are_dropped_and_ordinary_relays_kept(self):
         intel = {
-            "2.2.2.2": {**CLEAN, "hosting": True},
-            "3.3.3.3": {**CLEAN, "proxycheck_risk": 60.0},
-            "4.4.4.4": {**CLEAN, "proxycheck_proxy": True},
+            "2.2.2.2": {**CLEAN, "tor": True},
+            "3.3.3.3": {**CLEAN, "residential_proxy": True},
+            "4.4.4.4": {**CLEAN, "compromised": True},
+            "5.5.5.5": {**CLEAN, "hosting": True, "proxycheck_proxy": True, "proxycheck_risk": 100.0},
         }
-        nodes = [candidate(ip) for ip in ("1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4")]
+        nodes = [candidate(ip) for ip in ("1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5")]
         with self.upstream(nodes, intel):
             self.assertEqual(self.run_cli(), 0)
-        self.assertEqual(self.yaml_text().count("type: openvpn"), 1)
-        self.assertIn('server: "1.1.1.1"', self.yaml_text())
+        published = self.yaml_text()
+        self.assertEqual(published.count("type: openvpn"), 2)
+        self.assertTrue(all(f'server: "{ip}"' in published for ip in ("1.1.1.1", "5.5.5.5")))
 
     def test_provider_failures_are_summarized_in_the_log(self):
         failed = {

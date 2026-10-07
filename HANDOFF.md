@@ -19,7 +19,7 @@ A successful scheduled run should:
 2. survive one or more source failures without destroying the previous good state;
 3. reject unsafe/unparseable OpenVPN profiles;
 4. separate fresh observations from cached recovery data;
-5. prefer stable US ISP-like endpoints and **publish nothing rather than a risky node**: hosting, proxy/VPN, Tor, residential-proxy, high-risk, high-abuse and unknown-reputation addresses are rejected outright;
+5. prefer stable US ISP-like endpoints and **publish nothing rather than a dangerous node**: Tor, compromised-host, residential-proxy, high-abuse, non-US and unknown-reputation addresses are rejected outright; hosting, proxy/VPN and risk-score verdicts only lower the rank (every public relay carries them);
 6. prefer preserve a healthy previous primary to reduce IP churn;
 7. keep ASN diversity in the Preferred pool;
 8. generate a valid, non-empty `mihomo.yaml`;
@@ -34,7 +34,7 @@ Current package metadata:
 - Python requirement: `>=3.11`
 - third-party Python dependencies: **none**
 - GitHub Actions Python: **3.13**
-- unit tests: **107**
+- unit tests: **110**
 
 Verification performed for this handoff:
 
@@ -43,7 +43,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q gate_us_lite tests
 ```
 
-Result: **107 tests passed (1 skipped when no Mihomo binary is available); compileall passed**. `ruff check --select F,B,E9` and `actionlint` are clean.
+Result: **110 tests passed (1 skipped when no Mihomo binary is available); compileall passed**. `ruff check --select F,B,E9` and `actionlint` are clean.
 
 ### Version consistency
 
@@ -91,7 +91,7 @@ Result: **107 tests passed (1 skipped when no Mihomo binary is available); compi
 | `log.py` | Stderr progress logging and `tally`, the most frequent reasons for a log line |
 | `sources.py` | VPNGate, PublicVPNList, Vpngate-Scraper adapters |
 | `ovpn.py` | Security-sensitive OpenVPN allow-list parser |
-| `intel.py` | IP/public-network validation, ipwho.is (country/ASN/ISP), optional ProxyCheck v3 (hosting/Tor/proxy/risk/residential proxy), optional AbuseIPDB, ISP/hosting heuristics |
+| `intel.py` | IP/public-network validation, ipwho.is (country/ASN/ISP), optional ProxyCheck v3 (hosting/Tor/compromised/proxy/risk/residential proxy), optional AbuseIPDB, ISP/hosting heuristics |
 | `store.py` | SQLite observations, source snapshots, last-good caches, probe history, intel cache, sticky selection state |
 | `select.py` | Deduplication, rough rank, risk evaluation, Preferred/Fallback selection, ASN diversity, sticky primary |
 | `probe.py` | Lightweight TCP connect probe only; not a full OpenVPN handshake |
@@ -181,9 +181,11 @@ Current PublicVPNList policy requires Bearer authentication for API/export acces
 
 Current behavior when absent: **PublicVPNList is skipped cleanly**.
 
-Contract facts (OpenAPI 1.4.0 and the API pages, read 2026-10-07): a free key lasts 24 hours and is issued after reCAPTCHA; `401` means a missing, expired or revoked key; an empty catalog is HTTP `200` with `data: []`; the limit is 60 requests per minute. `config_download_url` is `string | null`: for OpenVPN the documentation points to `server_page_url`, a protected download page, when it is null, which an unattended run cannot use. The adapter keeps only records with a download link and downloads the best `publicvpnlist_materialize_limit` of them. The key is sent to `publicvpnlist.com` and its subdomains only.
+Contract facts (OpenAPI 1.4.0 and the API pages, read 2026-10-07): a free key lasts 24 hours and is issued after reCAPTCHA; `401` means a missing, expired or revoked key; an empty catalog is HTTP `200` with `data: []`; the limit is 60 requests per minute. `config_download_url` is `string | null`: the OpenVPN protocol page says "OpenVPN uses its existing protected download flow: use server_page_url when this field is null", and the API page adds that individual OpenVPN checks "still use their existing single-use download token". The OpenAPI contract has no separate download endpoint and no `server_page_url` field in its `Server` schema (`GET /servers`, `/servers/{public_id}`, `/countries`, `/protocols`, `/stats`, `/dataset`, `/health` only), and the request sends no `fields` filter. An unattended run cannot use the protected flow, and it must not try to get around it. The adapter keeps only records with a download link and downloads the best `publicvpnlist_materialize_limit` of them. The key is sent to `publicvpnlist.com` and its subdomains only.
 
-When the key works but nothing comes out, the source raises an error that names the stage that lost the records, for example `[warn] publicvpnlist: 104 records, 0 with a download link, 0 usable profiles` or `... 8 with a download link, 0 usable profiles (8x HTTPError 410)`. An empty catalog is a plain empty result. As of 2026-10-07 the cause of an `empty` line seen in a scheduled run of the earlier code (which did not report the stage) has not been determined: no key was available to reproduce it.
+When the key works but nothing comes out, the source raises an error that names the stage that lost the records, for example `[warn] publicvpnlist: 104 records, 0 with a download link, 0 usable profiles` or `... 8 with a download link, 0 usable profiles (8x HTTPError 410)`. An empty catalog is a plain empty result.
+
+Observed on GitHub (run 37563265591, 2026-10-07, permanent key): `[warn] publicvpnlist: 106 records, 0 with a download link, 0 usable profiles`. The protocol page lists 108 US OpenVPN records. So the source contributes no node for as long as OpenVPN records carry no download link; this matches the documented flow. The detail endpoint (`GET /servers/{public_id}`) was not tried because that needs the key.
 
 ### `ABUSEIPDB_API_KEY`
 
@@ -198,9 +200,9 @@ Current behavior when absent: **AbuseIPDB enrichment is skipped**.
 
 ### `PROXYCHECK_API_KEY`
 
-Effectively required. With `require_known_intel = true` an address without a ProxyCheck verdict is unknown and never published. When configured, the code queries ProxyCheck v3 (`/v3/<ip>?key=...`) and maps `detections.tor`, `detections.hosting` (or `network.type == "Hosting"`), `detections.anonymous` (proxy/VPN aggregate), `detections.risk` and an `operator.services` entry `residential_proxies` (residential-proxy signal). It is the only provider of Tor, proxy, risk and residential-proxy verdicts. ProxyCheck documents that every key is always present and that missing data is `null`, so `tor`, `hosting`, `anonymous` must be booleans and `risk` a number; anything else raises, the status becomes `error`, and the address is unknown instead of silently clean (a schema drift therefore stops publication rather than approving everything). The request adds `days=<proxycheck_lookback_days>` (default 30, documented range 0.01-60; ProxyCheck's own default window is 2-7 days tuned to avoid false positives) so that recently flagged addresses stay flagged, even at low confidence. A free key allows 1,000 queries per day according to ProxyCheck's status-code table; the `[intel] errors:` log line shows quota and contract failures.
+Effectively required. With `require_known_intel = true` an address without a ProxyCheck verdict is unknown and never published. When configured, the code queries ProxyCheck v3 (`/v3/<ip>?key=...`) and maps `detections.tor`, `detections.compromised`, `detections.hosting` (or `network.type == "Hosting"`), `detections.anonymous` (proxy/VPN aggregate), `detections.risk` and an `operator.services` entry `residential_proxies` (residential-proxy signal). It is the only provider of Tor, compromised-host, proxy, risk and residential-proxy verdicts. ProxyCheck documents that every key is always present and that missing data is `null`, so `tor`, `compromised`, `hosting`, `anonymous` must be booleans and `risk` a number; anything else raises, the status becomes `error`, and the address is unknown instead of silently clean (a schema drift therefore stops publication rather than approving everything). The request adds `days=<proxycheck_lookback_days>` (default 30, documented range 0.01-60; ProxyCheck's own default window is 2-7 days tuned to avoid false positives) so that recently flagged addresses stay flagged, even at low confidence. A free key allows 1,000 queries per day according to ProxyCheck's status-code table; the `[intel] errors:` log line shows quota and contract failures.
 
-Current behavior when absent: with `require_known_intel = true` (default) the all-in-one run and `finish` raise `ConfigurationError` before doing any work and the CLI exits with code 4 and an explicit message; the run is not silently reduced to exit code 2. The current implementation does not use ProxyCheck anonymous mode. Setting `require_known_intel = false` would let nodes through on ipwho data alone, but then hosting, Tor, proxy and residential-proxy verdicts stay unknown (not clean); only the ISP keyword heuristics can still mark an address as hosting.
+Current behavior when absent: with `require_known_intel = true` (default) the all-in-one run and `finish` raise `ConfigurationError` before doing any work and the CLI exits with code 4 and an explicit message; the run is not silently reduced to exit code 2. The current implementation does not use ProxyCheck anonymous mode. Setting `require_known_intel = false` would let nodes through on ipwho data alone, but then Tor, compromised-host, hosting, proxy and residential-proxy verdicts stay unknown (not clean); only the ISP keyword heuristics can still mark an address as hosting.
 
 ### Zero-key intelligence
 
@@ -393,7 +395,7 @@ UDP nodes are not penalized for lacking this probe.
 
 - the top `tunnel_probe_limit` candidates are probed in parallel, UDP and TCP alike;
 - each candidate must fetch `https://www.cloudflare.com/cdn-cgi/trace` through its listener within `tunnel_probe_timeout_seconds`; the reported `ip=` must be public and different from the address the `DIRECT` listener reports for the runner, otherwise the traffic bypassed the tunnel;
-- survivors take the observed address as `exit_ip`; for the others the failure reason is read from Mihomo's log (for example `make OpenVPN handshake: read hard reset response after 0 retransmits: context deadline exceeded`) and the three most common reasons are logged as `[tunnel] ...`;
+- survivors take the observed address as `exit_ip`; for the others the failure reason is read from Mihomo's log (for example `make OpenVPN handshake: read hard reset response after 0 retransmits: context deadline exceeded`) and the five most common reasons are logged as `[tunnel] ...`, with node addresses masked as `<addr>` so that one kind of failure adds up across nodes;
 - Mihomo v1.19.31 gives up an OpenVPN handshake after about 5 seconds, so a round with dead nodes takes about that long;
 - the Mihomo child gets a scrubbed environment (only `HOME`);
 - if the binary is missing, Mihomo exits at startup, never becomes ready or the `DIRECT` control request fails, `TunnelProbeUnavailable` is raised: nothing is published and the CLI exits with code 3. There is no unverified mode.
@@ -412,13 +414,16 @@ All checks look at the intelligence for the **observed exit address** (the tunne
 | `intel_unknown` | ipwho or ProxyCheck did not return `ok`, including a ProxyCheck reply with a missing or null verdict | `require_known_intel` (default true) |
 | `country_mismatch` | ipwho country differs from the source's country (a blank country counts as a mismatch) | `reject_country_mismatch` |
 | `tor` | ProxyCheck `detections.tor` or AbuseIPDB `isTor` | `reject_tor` |
+| `compromised` | ProxyCheck `detections.compromised` | `reject_compromised` |
 | `residential_proxy` | ProxyCheck operator service `residential_proxies` | `reject_residential_proxy` |
-| `hosting` | ProxyCheck hosting verdict, AbuseIPDB usage type `Data Center/Web Hosting/Transit`, or ISP keyword heuristic | `reject_hosting` |
-| `proxy` | ProxyCheck `detections.anonymous` (proxy or VPN) | `reject_proxy` (default true) |
-| `high_risk` | ProxyCheck risk above `max_proxycheck_risk` (default 25) | `max_proxycheck_risk` |
+| `hosting` | ProxyCheck hosting verdict, AbuseIPDB usage type `Data Center/Web Hosting/Transit`, or ISP keyword heuristic | `reject_hosting` (default false) |
+| `proxy` | ProxyCheck `detections.anonymous` (proxy or VPN) | `reject_proxy` (default false) |
+| `high_risk` | ProxyCheck risk above `max_proxycheck_risk` (default 100, which never fires) | `max_proxycheck_risk` |
 | `severe_recent_abuse` | AbuseIPDB confidence `>= 80` (when AbuseIPDB data exists) | always |
 
-`max_proxycheck_risk = 25` is the top of ProxyCheck's documented "allow" band for addresses that are not anonymous. ProxyCheck's base risk scores are hosting 33, VPN 50, scraper and Tor 75, proxy and compromised 100, so `high_risk` also rejects those even if the dedicated filter is switched off.
+Why `hosting`, `proxy` and `high_risk` are off by default: ProxyCheck's base risk scores follow the detection type (hosting 33, VPN 50, scraper and Tor 75, proxy and compromised 100, per its documentation), and on 2026-10-07 every one of seven sampled US candidates of the VPN Gate family was `anonymous` with risk 34 to 100 (six at 100); two were hosting. With hosting, `anonymous` and a risk limit of 25 all rejecting, none of the six candidates of the first sample would have passed even if every one had been alive. The risk score cannot separate relays, and it also stood in for `compromised` (base score 100), which is why `compromised` is checked on its own: without it a compromised host would pass once the score no longer rejects. The three knobs stay in the code and the config so that a stricter policy is one edit away (`reject_hosting = true`, `reject_proxy = true`, `max_proxycheck_risk = 25`, the top of ProxyCheck's documented "allow" band for non-anonymous addresses).
+
+Seven-candidate sample, 2026-10-07 (keyless ProxyCheck v3 with `days=30`, entry address, no tunnel): operator PacketStream with the service `residential_proxies` on three addresses (two of them Charter Communications, one also flagged `scraper`), hosting on Cloudflare (an address ipwho.is places in Thailand, so a `country_mismatch` for a US candidate) and Contabo, `proxy` on a University of California address and on one more business-class address, `compromised` false on all seven. Under the default policy the three PacketStream addresses and the Cloudflare address are rejected and the other three would have passed had their tunnels been alive. The entry address is not always the exit address; the pipeline checks the exit address the tunnel probe observed.
 
 ### Preferred-only restrictions
 
@@ -441,8 +446,8 @@ Signals include:
 - TCP reachability;
 - locally observed 24h/7d availability;
 - fixed-line ISP heuristics;
-- hosting heuristics, with a clean bonus only when ProxyCheck evaluated the address and a penalty when hosting status is unknown (relevant once the hard rejects are relaxed);
-- ProxyCheck proxy/risk penalties (relevant once the hard rejects are relaxed);
+- hosting heuristics, with a clean bonus only when ProxyCheck evaluated the address and a penalty when hosting status is unknown (the hosting verdict only ranks unless `reject_hosting` is on);
+- ProxyCheck proxy/risk penalties (they only rank unless `reject_proxy` or a risk limit is set);
 - optional AbuseIPDB confidence;
 - multiple provenance records;
 - recent TCP-failure streak.
@@ -551,12 +556,13 @@ source_low_watermark_min_baseline = 4
 max_ping_ms = 250
 min_speed_mbps = 0.5
 require_known_intel = true
-reject_hosting = true
 reject_tor = true
-reject_proxy = true
+reject_compromised = true
 reject_residential_proxy = true
 reject_country_mismatch = true
-max_proxycheck_risk = 25
+reject_hosting = false
+reject_proxy = false
+max_proxycheck_risk = 100
 min_preferred_availability_24h = 0.25
 max_preferred_tcp_fail_streak = 2
 ```
@@ -579,7 +585,7 @@ Skip/fail that adapter only; other sources continue. A key that works but yields
 
 ### IP intelligence provider fails
 
-ipwho or ProxyCheck failing makes the affected nodes unknown, so they are not published until a later run succeeds (error results are retried after 15 minutes). If that is every node, the run exits with code 2 and the old YAML stays. An AbuseIPDB failure only drops the abuse signal. Nothing here fails generation by itself. The `[intel] errors:` log line lists the three most common provider failure reasons (HTTP status, quota, incomplete verdict).
+ipwho or ProxyCheck failing makes the affected nodes unknown, so they are not published until a later run succeeds (error results are retried after 15 minutes). If that is every node, the run exits with code 2 and the old YAML stays. An AbuseIPDB failure only drops the abuse signal. Nothing here fails generation by itself. The `[intel] errors:` log line lists the five most common provider failure reasons (HTTP status, quota, incomplete verdict).
 
 ### ProxyCheck key missing
 
@@ -620,7 +626,8 @@ Return non-zero (this includes every candidate failing the tunnel probe) and do 
 - endpoint merge/provenance;
 - ASN diversity;
 - sticky primary;
-- hard rejects for Preferred and Fallback alike (unknown intelligence, hosting, proxy, Tor, residential proxy, country, risk threshold, abuse) and their relaxation through the filters;
+- hard rejects for Preferred and Fallback alike (unknown intelligence, Tor, compromised host, residential proxy, country, abuse), the default policy that publishes hosting/proxy/high-risk relays, and the stricter hosting, proxy and risk-limit switches;
+- intelligence cached under another schema version is never reused;
 - repeated TCP failure behavior;
 - actual-refresh-run availability denominator;
 - source rolling baseline;
@@ -629,7 +636,7 @@ Return non-zero (this includes every candidate failing the tunnel probe) and do 
 - cached recovery not faking availability;
 - generator writes YAML only, and the YAML carries no scores;
 - tunnel probe: probe-config rendering (validated by a real Mihomo when available), exit-IP and tunnel-bypass guards, failure reasons from Mihomo's log, an unavailable harness failing closed;
-- pipeline: dead nodes are dropped and the exit address is what intelligence checks, unknown or risky exits are not published, the previous YAML survives exit codes 2 and 3, the stage hand-over through files, verdict filtering, probe limit;
+- pipeline: dead nodes are dropped and the exit address is what intelligence checks, unknown or dangerous exits are not published, the previous YAML survives exit codes 2 and 3, the stage hand-over through files, verdict filtering, probe limit;
 - intelligence: ProxyCheck v3 mapping, incomplete verdicts as errors, the lookback window in the request, AbuseIPDB hosting/Tor opinion, ipwho free tier without security verdicts, `hosting_known` semantics;
 - pipeline configuration: missing ProxyCheck key (exit code 4), relaxed requirement, lookback window plumbing, provider failure summary;
 - `fetch`: HTTP status in errors, proxy support, https only, redirects that never carry headers to another origin, `FetchError.reason`; `tally`;
@@ -644,18 +651,18 @@ These are the most useful starting points for future work.
 | Risk | Status | Reasoning |
 |---|---|---|
 | A relay operator can read or alter unencrypted traffic and DNS | accepted, inherent | Every node is a relay run by someone else; the filters judge addresses, not operators. README "Trust model" tells consumers to rely on end-to-end encryption. |
-| A public relay that no configured provider knows still passes the filters | open, inherent | "Clean" means unknown to ipwho, ProxyCheck and AbuseIPDB, not "not a relay". ProxyCheck, for example, reports `us16.vpnbook.com` (a VPNBook server) with `vpn: false` and `anonymous: false`; it is rejected only because the address is hosting and its risk score is 33. |
+| Public relays are published | accepted, inherent | Hosting, known-VPN and risk-score verdicts only rank a node, and a relay that no configured provider has flagged passes as well; the checks reject Tor, compromised hosts, residential-proxy networks, abuse reports, a wrong country and a missing verdict, nothing about the operator. ProxyCheck reports `us16.vpnbook.com` (a VPNBook server) with `vpn: false`, `anonymous: false`, hosting and risk 33: such a node would be published. |
 | A provider changes or breaks its response | mitigated | ProxyCheck replies without complete booleans and a numeric risk are errors, so the address is unknown and not published. |
 | The ProxyCheck free quota (1,000 queries/day) runs out | mitigated | Complete verdicts are cached for 24 h; exhaustion fails closed and shows up in the `[intel] errors:` line. |
 | Profile download URLs come from upstream data | mitigated | `fetch` is https only, the PublicVPNList key is only sent to its own domain, redirects never carry headers to another origin, and fetched text only passes through the OVPN allow-list. |
 | A compromised probe job forges artifacts | mitigated | Pool and state are verified by SHA-256, verdicts are filtered, the state is not cached after a failed check. |
 | A compromised probe job plants a forged Actions cache entry | accepted | See the trust-boundary note below. |
 | Scope of the Actions runtime token | open, unverified | Not checked against GitHub's documentation or a real run. |
-| The previously published YAML stays in place after exit code 2 | open, decision needed | The retained nodes were acceptable once; the run found none acceptable now (flagged, dead, delisted, or only unverifiable because a provider was down). Keeping the file favours availability over "better no node than a risky one" on the consumer side. A grace period after which a node-less YAML is published would reverse that trade-off; it changes consumer behaviour, so it has not been added without a decision. |
+| The previously published YAML stays in place after exit code 2 | open, decision needed | The run found no acceptable node (dead, rejected, delisted, or only unverifiable because a provider was down) and keeps the old file, which may hold nodes the current checks were never applied to: on 2026-10-07 it held 11 residential-ISP nodes. The first run on GitHub that applied the current checks probed 6 candidates through real tunnels and found 1 alive, which was rejected as a residential proxy. The first successful run replaces the file. Keeping it favours availability over "better no node than a dangerous one" on the consumer side. A grace period after which a node-less YAML is published would reverse that trade-off; it changes consumer behaviour (a `REJECT` or `DIRECT` placeholder), so it has not been added without a decision. |
 | Legacy OpenVPN ciphers (CBC, SHA1/MD5 HMAC) are passed through | accepted | The relay terminates the tunnel anyway; weak data-channel crypto would only matter against a third party on the path (my assessment). |
 | A node can be flagged or die between the probe and its use | accepted | Mihomo's `fallback` groups health-check every 300 s and skip dead nodes. A node that is flagged or listed after the probe stays in the YAML until the next run, which at one run every second day can take up to two days (a manual run refreshes it at once); a shorter cron interval narrows the window. That free relays come and go quickly is an assumption; no lifetime data was measured. |
 | PublicVPNList free keys expire after 24 hours | mitigated | This repository uses a permanent key (confirmed by the maintainer). With a temporary key an unattended run gets HTTP 401 and the source drops out; the other sources continue and the last-good cache covers the gap for 4 days. |
-| GitHub disables the schedule of a quiet public repository | open, unverified | GitHub's documentation (read 2026-10-07): in a public repository scheduled workflows are disabled after 60 days without repository activity, and `schedule` runs can be delayed or dropped under load. The YAML is deterministic, so commits only happen when the selection changes, which the strict policy can make rare. Whether this repository is public, and whether the workflow's own pushes count as activity, was not checked. If the schedule stops, re-enable the workflow in the Actions tab. |
+| GitHub disables the schedule of a quiet public repository | open, unverified | GitHub's documentation (read 2026-10-07): in a public repository scheduled workflows are disabled after 60 days without repository activity, and `schedule` runs can be delayed or dropped under load. The YAML is deterministic, so commits only happen when the selection changes, which a policy that finds few nodes makes rare. The repository is public (GitHub API, 2026-10-07). Whether the workflow's own pushes count as activity was not checked. If the schedule stops, re-enable the workflow in the Actions tab. |
 
 ### P0 — version metadata skew
 
@@ -701,7 +708,7 @@ CFNext uses a Cloudflare tunnel in front of VPNGate to solve networks that canno
 
 ### P2 — additional independent sources
 
-Only add another source when it meaningfully increases independent US endpoint coverage or resilience. Do not count mirrors of the same VPNGate data as source diversity. IPSpeed's own page sits behind a Cloudflare managed challenge that the stdlib HTTP client cannot pass, and VPNBook's US servers are OVH hosting addresses (ProxyCheck `network.type = Hosting`) behind a JavaScript-driven download page, so they would be rejected as hosting anyway; revisit either only with new evidence.
+Only add another source when it meaningfully increases independent US endpoint coverage or resilience. Do not count mirrors of the same VPNGate data as source diversity. IPSpeed's own page sits behind a Cloudflare managed challenge that the stdlib HTTP client cannot pass, and VPNBook's US servers are OVH hosting addresses (ProxyCheck `network.type = Hosting`) behind a JavaScript-driven download page that the stdlib HTTP client cannot use; revisit either only with new evidence.
 
 ## 22. Recommended next optimization order
 
@@ -751,7 +758,7 @@ Re-verified on 2026-10-02 and 2026-10-07:
 - Mihomo currently documents OpenVPN fields including `tls-auth`, `key-direction`, `tls-crypt`, and `tls-crypt-v2`.
 - Mihomo `fallback` selects the first available node in configured order when the current node times out.
 - The ipwho.is free tier returns no `security` object.
-- ProxyCheck v3 returns `detections` (`tor`, `hosting`, `anonymous`, `risk`, ...), `network.type` and `operator.services`; its documentation puts risk 0-25 in the "allow" band for addresses that are not anonymous and lists base scores of hosting 33, VPN 50, scraper and Tor 75, proxy and compromised 100.
+- ProxyCheck v3 returns `detections` (`tor`, `compromised`, `hosting`, `anonymous`, `risk`, ...), `network.type` and `operator.services`; its documentation puts risk 0-25 in the "allow" band for addresses that are not anonymous and lists base scores of hosting 33, VPN 50, scraper and Tor 75, proxy and compromised 100.
 - `actions/upload-artifact`, `actions/download-artifact` and `actions/cache/{restore,save}` expose the inputs the workflow uses (`include-hidden-files`, `retention-days`, `if-no-files-found`, `name`, `path`, `key`, `restore-keys`).
 - PublicVPNList publishes IPSpeed rows; VPNBook is metadata-only there and not published through the API.
 - Mihomo v1.19.31 `mixed` listeners accept `proxy: <outbound>`, and its OpenVPN handshake gives up after about 5 seconds.

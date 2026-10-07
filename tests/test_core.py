@@ -269,9 +269,12 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(pref[0].dedupe_key,c.dedupe_key)
         self.assertEqual(len({x.intel['asn_key'] for x in pref}),3)
 
-    def test_hosting_is_never_published(self):
-        good=self.mk('1.1.1.1','AS1',50); host=self.mk('2.2.2.2','AS2',100,hosting=True)
-        self.assertEqual(choose([good,host],SELECTION_CFG,{}),([good],[]))
+    def test_rejected_node_is_never_published(self):
+        good=self.mk('1.1.1.1','AS1',50); tor=self.mk('2.2.2.2','AS2',100)
+        tor.intel['tor']=True
+        evaluate(tor,FILTERS); tor.selection_score=100
+        self.assertEqual(tor.reject_reasons,['tor'])
+        self.assertEqual(choose([good,tor],SELECTION_CFG,{}),([good],[]))
 
     def test_two_tcp_failures_remove_only_preferred(self):
         tcp=self.mk('1.1.1.1','AS1',100,proto='tcp')

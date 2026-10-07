@@ -11,7 +11,8 @@ from gate_us_lite.models import Candidate, OpenVPNProfile
 from gate_us_lite.select import evaluate
 from gate_us_lite.store import Store
 
-STRICT = DEFAULTS["filters"]
+POLICY = DEFAULTS["filters"]
+STRICT = {**POLICY, "reject_hosting": True, "reject_proxy": True, "max_proxycheck_risk": 25}
 CLEAN = {"ipwho_status": "ok", "proxycheck_status": "ok", "country_code": "US", "hosting_known": True}
 
 
@@ -20,7 +21,7 @@ def response(payload: dict) -> HTTPResponse:
 
 
 def proxycheck_payload(ip: str, *, detections=None, operator=None, network_type="Business") -> dict:
-    base = {"tor": False, "hosting": False, "anonymous": False, "risk": 0}
+    base = {"tor": False, "compromised": False, "hosting": False, "anonymous": False, "risk": 0}
     return {"status": "ok", ip: {
         "network": {"type": network_type},
         "detections": {**base, **(detections or {})},
@@ -97,6 +98,16 @@ class TestIntel(unittest.TestCase):
                         self.assertEqual(st.get_intel(ip, ttl=86400, error_ttl=900) is not None, long_lived)
             st.close()
 
+    def test_intel_cached_under_another_schema_is_never_reused(self):
+        known = {"ipwho_status": "ok", "proxycheck_status": "ok"}
+        with tempfile.TemporaryDirectory() as td:
+            st = Store(Path(td) / "s.db")
+            st.put_intel("1.1.1.1", {**known, "intel_schema": intel_mod.INTEL_SCHEMA - 1})
+            st.put_intel("2.2.2.2", {**known, "intel_schema": intel_mod.INTEL_SCHEMA})
+            self.assertIsNone(st.get_intel("1.1.1.1"))
+            self.assertIsNotNone(st.get_intel("2.2.2.2"))
+            st.close()
+
     def test_ipwho_free_tier_carries_no_security_verdicts(self):
         payload = {
             "success": True, "country_code": "US",
@@ -113,7 +124,7 @@ class TestIntel(unittest.TestCase):
             got = intel_mod._proxycheck("1.1.1.1", "key", 6)
         self.assertIn("/v3/1.1.1.1?key=key", fetch.call_args.args[0])
         self.assertEqual(got, {
-            "tor": False, "hosting": False, "proxycheck_proxy": True,
+            "tor": False, "compromised": False, "hosting": False, "proxycheck_proxy": True,
             "proxycheck_risk": 100.0, "residential_proxy": True,
         })
 
@@ -127,10 +138,15 @@ class TestIntel(unittest.TestCase):
             with patch.object(intel_mod, "fetch", return_value=response(payload)):
                 self.assertTrue(intel_mod._proxycheck("1.1.1.1", "key", 6)["hosting"])
 
+    def test_proxycheck_flags_a_compromised_host(self):
+        payload = proxycheck_payload("1.1.1.1", detections={"compromised": True})
+        with patch.object(intel_mod, "fetch", return_value=response(payload)):
+            self.assertTrue(intel_mod._proxycheck("1.1.1.1", "key", 6)["compromised"])
+
     def test_proxycheck_clean_address_without_operator(self):
         with patch.object(intel_mod, "fetch", return_value=response(proxycheck_payload("1.1.1.1"))):
             got = intel_mod._proxycheck("1.1.1.1", "key", 6)
-        self.assertFalse(any(got[k] for k in ("tor", "hosting", "proxycheck_proxy", "residential_proxy")))
+        self.assertFalse(any(got[k] for k in ("tor", "compromised", "hosting", "proxycheck_proxy", "residential_proxy")))
 
     def test_proxycheck_denied_or_empty_result_is_an_error(self):
         denied = {"status": "denied", "message": "1,000 Free queries exhausted."}
@@ -145,7 +161,7 @@ class TestIntel(unittest.TestCase):
         with patch.object(intel_mod, "fetch", return_value=response(PROXYCHECK_V3_SAMPLE)):
             got = intel_mod._proxycheck("147.135.15.16", "key", 6)
         self.assertEqual(got, {
-            "tor": False, "hosting": True, "proxycheck_proxy": False,
+            "tor": False, "compromised": False, "hosting": True, "proxycheck_proxy": False,
             "proxycheck_risk": 33.0, "residential_proxy": False,
         })
 
@@ -157,6 +173,8 @@ class TestIntel(unittest.TestCase):
             "missing risk": {key: value for key, value in complete.items() if key != "risk"},
             "null tor flag": {**complete, "tor": None},
             "missing anonymous flag": {key: value for key, value in complete.items() if key != "anonymous"},
+            "null compromised flag": {**complete, "compromised": None},
+            "missing compromised flag": {key: value for key, value in complete.items() if key != "compromised"},
             "hosting as text": {**complete, "hosting": "false"},
         }
         for name, detections in broken.items():
@@ -219,9 +237,9 @@ class TestIntel(unittest.TestCase):
 
 class TestEvaluateIntel(unittest.TestCase):
     def score(self, intel: dict) -> float:
-        return evaluate(candidate(intel), STRICT).selection_score
+        return evaluate(candidate(intel), POLICY).selection_score
 
-    def reasons(self, intel: dict, filters: dict = STRICT) -> list[str]:
+    def reasons(self, intel: dict, filters: dict = POLICY) -> list[str]:
         return evaluate(candidate({**CLEAN, **intel}), filters).reject_reasons
 
     def test_clean_bonus_requires_a_provider_verdict(self):
@@ -239,26 +257,37 @@ class TestEvaluateIntel(unittest.TestCase):
     def test_clean_known_address_is_accepted(self):
         self.assertEqual(self.reasons({}), [])
 
-    def test_every_risk_verdict_is_a_hard_reject(self):
-        cases = {
+    def test_default_policy_publishes_public_relays_but_not_dangerous_ones(self):
+        relay = {"hosting": True, "hosting_heuristic": True, "proxycheck_proxy": True, "proxycheck_risk": 100.0}
+        self.assertEqual(self.reasons(relay), [])
+        dangerous = {
             "tor": {"tor": True},
+            "compromised": {"compromised": True},
             "residential_proxy": {"residential_proxy": True},
-            "hosting": {"hosting": True},
-            "proxy": {"proxycheck_proxy": True},
-            "high_risk": {"proxycheck_risk": 26},
             "severe_recent_abuse": {"abuse_confidence": 80},
             "country_mismatch": {"country_code": "DE"},
             "invalid_ip": {"invalid_ip": True},
         }
+        for reason, intel in dangerous.items():
+            with self.subTest(reason):
+                self.assertIn(reason, self.reasons({**relay, **intel}))
+
+    def test_every_risk_verdict_can_be_made_a_hard_reject(self):
+        cases = {
+            "hosting": {"hosting": True},
+            "proxy": {"proxycheck_proxy": True},
+            "high_risk": {"proxycheck_risk": 26},
+        }
         for reason, intel in cases.items():
             with self.subTest(reason):
-                self.assertIn(reason, self.reasons(intel))
+                self.assertEqual(self.reasons(intel, STRICT), [reason])
 
-    def test_hosting_keyword_heuristic_is_a_hard_reject(self):
-        self.assertIn("hosting", self.reasons({"hosting_heuristic": True}))
+    def test_hosting_keyword_heuristic_follows_the_hosting_filter(self):
+        self.assertEqual(self.reasons({"hosting_heuristic": True}), [])
+        self.assertEqual(self.reasons({"hosting_heuristic": True}, STRICT), ["hosting"])
 
     def test_risk_at_the_threshold_is_accepted(self):
-        self.assertEqual(self.reasons({"proxycheck_risk": 25.0}), [])
+        self.assertEqual(self.reasons({"proxycheck_risk": 25.0}, STRICT), [])
         self.assertEqual(self.reasons({"proxycheck_risk": 40}, {**STRICT, "max_proxycheck_risk": 50}), [])
 
     def test_unverified_country_is_a_mismatch(self):
@@ -268,14 +297,10 @@ class TestEvaluateIntel(unittest.TestCase):
         for intel in ({"ipwho_status": "error"}, {"proxycheck_status": "error"}, {"proxycheck_status": "disabled"}):
             with self.subTest(intel):
                 self.assertEqual(self.reasons(intel), ["intel_unknown"])
-        self.assertEqual(self.reasons({"proxycheck_status": "disabled"}, {**STRICT, "require_known_intel": False}), [])
+        self.assertEqual(self.reasons({"proxycheck_status": "disabled"}, {**POLICY, "require_known_intel": False}), [])
 
     def test_invalid_address_is_not_reported_as_unknown_intel(self):
         self.assertEqual(self.reasons({"invalid_ip": True, "ipwho_status": "invalid", "proxycheck_status": "skipped"}), ["invalid_ip"])
-
-    def test_each_filter_can_be_relaxed_individually(self):
-        relaxed = {**STRICT, "reject_hosting": False, "reject_proxy": False, "max_proxycheck_risk": 100}
-        self.assertEqual(self.reasons({"hosting": True, "proxycheck_proxy": True, "proxycheck_risk": 90}, relaxed), [])
 
 
 if __name__ == "__main__":

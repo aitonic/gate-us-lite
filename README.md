@@ -28,7 +28,7 @@ VPNGate Scraper ---/             |                        |
 
 The workflow runs every second day at 03:07 UTC (cron `7 3 */2 * *`; the day steps restart each month, so a 31-day month runs on the 31st and again on the 1st), and can also be started manually with **Actions -> Generate Mihomo US VPN list -> Run workflow**. It is split into three jobs (`collect` -> `probe` -> `publish`) so the process that dials untrusted VPN servers never sees a secret or a write token; see [GitHub Actions permission](#github-actions-permission).
 
-**Better no node than a risky one.** A node is published only if it completes a real OpenVPN handshake *and* ipwho.is plus ProxyCheck both returned a verdict for its observed exit address *and* that address is clean (not hosting, proxy/VPN, Tor, residential proxy, or above the risk limit). When no node qualifies the run fails and the previously committed `mihomo.yaml` stays in place.
+**Better no node than a dangerous one.** A node is published only if it completes a real OpenVPN handshake *and* ipwho.is plus ProxyCheck both returned a verdict for its observed exit address *and* that is a US address which is not a Tor exit, a compromised host or part of a residential-proxy network, and has no severe abuse reports. Every node is still a public relay run by someone else (see the [trust model](#trust-model)). Hosting, known-VPN and high-risk-score verdicts do not reject a node, because ProxyCheck gave them to every public relay in the samples taken so far (see [IP-risk limits](#ip-risk-limits)); they only lower its rank. When no node qualifies the run fails and the previously committed `mihomo.yaml` stays in place.
 
 ## Output
 
@@ -57,6 +57,8 @@ Primary adapters:
 - **PublicVPNList** -- optional verified/full-tunnel catalog. Each record keeps the family of its upstream source (VPN Gate, IPSpeed, ...), so mirrors do not count as independent evidence.
 - **Vpngate-Scraper-API** -- VPNGate-family recovery source. It is tagged as the same `vpngate` source family so mirrors do not count as independent evidence.
 
+The US supply is small. On 2026-10-07 the VPN Gate list held 100 servers worldwide, 4 of them in the US, and the scraper's README listed 5 US servers of the same family; PublicVPNList reported 108 US OpenVPN records but offered no download link for any of them (see `PUBLICVPNLIST_API_KEY`). One run therefore sees roughly 5-10 US candidates, and only the ones that answer a real OpenVPN handshake and pass the checks below are published.
+
 Source failures are isolated. The last successful candidates of each source are kept for `source_cache_max_age_seconds` (4 days, so the stand-in outlives one missed run of the every-second-day schedule) in `.state/state.sqlite3`, which is preserved between workflow runs with GitHub Actions cache; they go through the same tunnel probe and address checks as fresh candidates. If no acceptable node can be produced, the workflow fails and leaves the previously committed `mihomo.yaml` untouched.
 
 ### Low-watermark protection
@@ -79,9 +81,9 @@ PublicVPNList can expose a much larger metadata catalog than the final selector 
 All keys are optional. Add them under **Settings -> Secrets and variables -> Actions** if available:
 
 - `PUBLICVPNLIST_API_KEY` -- enables the larger PublicVPNList verified pool.
-  PublicVPNList also offers short-lived 24-hour access keys; for unattended scheduled Actions, use permanent access when available. An expired key (HTTP 401) degrades only this source and does not invalidate last-good state. When the key works but the source still yields nothing, the log names the stage that lost the records: `[warn] publicvpnlist: <records> records, <n> with a download link, 0 usable profiles (<reasons>)`. PublicVPNList documents `config_download_url` as nullable: some OpenVPN records are only reachable through a protected download page, and an unattended run cannot use those.
+  PublicVPNList also offers short-lived 24-hour access keys; for unattended scheduled Actions, use permanent access when available. An expired key (HTTP 401) degrades only this source and does not invalidate last-good state. When the key works but the source still yields nothing, the log names the stage that lost the records: `[warn] publicvpnlist: <records> records, <n> with a download link, 0 usable profiles (<reasons>)`. PublicVPNList documents that OpenVPN keeps "its existing protected download flow" with single-use download tokens, so `config_download_url` can be null for OpenVPN records and an unattended run cannot fetch those profiles. On 2026-10-07 a permanent key returned 106 US records, none with a download link; that matches the documented flow and does not point to a key problem.
 - `ABUSEIPDB_API_KEY` -- adds recent abuse reputation evidence and an independent second opinion on hosting (usage type `Data Center/Web Hosting/Transit`) and Tor.
-- `PROXYCHECK_API_KEY` -- the only provider of Tor, proxy, risk and residential-proxy verdicts (and the authoritative hosting verdict). **Effectively required:** without a ProxyCheck verdict an exit address is unknown, and unknown is never published (`require_known_intel`). While the filter is on and the key is missing, `publish` stops with exit code 4 and an explicit message. A free ProxyCheck key allows 1,000 queries a day (its documented limit); one run looks up at most `max_candidates_for_intel` (30) addresses, far below that limit at one run every second day. A reply with a missing or null verdict counts as an error, never as clean.
+- `PROXYCHECK_API_KEY` -- the only provider of Tor, compromised-host, residential-proxy, proxy/VPN and risk verdicts (and the authoritative hosting verdict). **Effectively required:** without a ProxyCheck verdict an exit address is unknown, and unknown is never published (`require_known_intel`). While the filter is on and the key is missing, `publish` stops with exit code 4 and an explicit message. A free ProxyCheck key allows 1,000 queries a day (its documented limit); one run looks up at most `max_candidates_for_intel` (30) addresses, far below that limit at one run every second day. A reply with a missing or null verdict counts as an error, never as clean.
 
 If `PUBLICVPNLIST_API_KEY` is absent, that source is skipped cleanly. Without `ABUSEIPDB_API_KEY` the abuse signal is simply missing.
 
@@ -120,9 +122,9 @@ The workflow intentionally has **no `pull_request` or `pull_request_target` trig
 7. Record **fresh observations only**. Cached recovery candidates may keep generation alive but never fake 1h/24h/7d availability.
 8. Run a cheap TCP connect probe on the top TCP candidates. It is only a soft GitHub-runner signal that orders the candidates for the next step, not an OpenVPN handshake.
 9. Dial the top candidates (`tunnel_probe_limit`) through real OpenVPN tunnels in a local Mihomo process (the `probe` job). A candidate survives only if it completes the handshake and fetches the Cloudflare trace through the tunnel from a public exit address that differs from the runner's own. That exit address replaces the endpoint address in the lookups below. If the probe cannot run at all, nothing is published.
-10. Enrich only the surviving top candidates with ipwho.is (country, ASN, ISP), ProxyCheck (Tor, hosting, proxy/VPN, residential proxy, risk; detections of the last `proxycheck_lookback_days` days) and optionally AbuseIPDB (abuse score plus an independent hosting/Tor opinion).
-11. Reject, for Preferred **and** Fallback alike: unknown intelligence (`require_known_intel`; this includes a ProxyCheck reply with a missing or null verdict), invalid or non-US exit addresses, Tor, residential proxies, hosting/datacenter addresses (ProxyCheck or ISP keyword), proxy/VPN detections (`reject_proxy`), a ProxyCheck risk above `max_proxycheck_risk` (25, the top of ProxyCheck's documented "allow" band) and severe recent abuse.
-12. Rank the rest: fixed-line ISP-like networks, longer availability, good source measurements, successful TCP reachability, and ASN diversity.
+10. Enrich only the surviving top candidates with ipwho.is (country, ASN, ISP), ProxyCheck (Tor, compromised host, hosting, proxy/VPN, residential proxy, risk; detections of the last `proxycheck_lookback_days` days) and optionally AbuseIPDB (abuse score plus an independent hosting/Tor opinion).
+11. Reject, for Preferred **and** Fallback alike: unknown intelligence (`require_known_intel`; this includes a ProxyCheck reply with a missing or null verdict), invalid or non-US exit addresses, Tor, compromised hosts, residential-proxy networks and severe recent abuse. Hosting/datacenter addresses (`reject_hosting`), proxy/VPN detections (`reject_proxy`) and a ProxyCheck risk above `max_proxycheck_risk` reject a node only when configured; by default they only lower its rank.
+12. Rank the rest: fixed-line ISP-like networks, longer availability, good source measurements, successful TCP reachability, ASN diversity, and a penalty for hosting, proxy/VPN and risk verdicts.
 13. A node that is clean but slow, dead on TCP twice in a row, or rarely available is kept out of Preferred and may remain Fallback.
 14. Keep the previous primary first while it remains eligible.
 15. Atomically replace `mihomo.yaml` only after at least one acceptable node exists; otherwise exit with code 2 and keep the old file.
@@ -145,11 +147,13 @@ Source cache entries include an internal schema version. A breaking parser/cache
 
 A residential/fiber ASN does **not** imply a private or clean residential IP. VPNGate-family addresses are public shared VPN relays. The project also deliberately avoids treating generic mail DNSBL membership as browser/account reputation; policy lists such as Spamhaus PBL commonly contain normal access-network addresses.
 
+ProxyCheck flagged every public relay in the sample taken so far. On 2026-10-07 all seven US candidates of the VPN Gate family were flagged as proxy/VPN with a risk score of 34 to 100, and three of them belonged to the PacketStream residential-proxy network. ProxyCheck's base score follows the detection type (proxy and compromised score 100), so a risk limit would reject every public relay without telling them apart. The defaults therefore reject only what does separate relays: Tor, compromised hosts, residential-proxy networks, abuse reports, a wrong country and a missing verdict. A residential-proxy exit is another person's home connection rented out through a proxy network, which is why that check stays on.
+
 Destination services maintain private reputation systems, so this selector improves node quality but cannot guarantee that a site will accept any particular IP.
 
 ### Trust model
 
-Every node is a relay run by someone else: VPN Gate volunteers, free VPN services, anonymous hosts. The relay operator can see which hosts you connect to and can read or alter whatever passes through unencrypted, DNS queries included; PublicVPNList says the same about its catalog ("Unknown third-party endpoints can still log or alter traffic; use end-to-end encryption and avoid sensitive accounts"). The filters above judge the **address** (hosting, proxy, Tor, risk, country) and that the tunnel really works; they say nothing about the honesty of the operator, and a clean verdict does not mean the address is not a public relay, only that none of the configured providers knows it as one. Treat the nodes as untrusted networks: rely on HTTPS/TLS/SSH end to end and keep credentials and sensitive accounts off them.
+Every node is a relay run by someone else: VPN Gate volunteers, free VPN services, anonymous hosts. The relay operator can see which hosts you connect to and can read or alter whatever passes through unencrypted, DNS queries included; PublicVPNList says the same about its catalog ("Unknown third-party endpoints can still log or alter traffic; use end-to-end encryption and avoid sensitive accounts"). The filters above judge the **address** (Tor, compromised host, residential-proxy network, abuse reports, country) and that the tunnel really works; they say nothing about the honesty of the operator, and a published node is still a public relay that ProxyCheck will usually list as a VPN or proxy. Treat the nodes as untrusted networks suited to low-risk traffic: rely on HTTPS/TLS/SSH end to end and keep credentials and sensitive accounts off them.
 
 ## Important configuration knobs
 
@@ -168,12 +172,13 @@ source_low_watermark_min_baseline = 4
 
 [filters]
 require_known_intel = true
-reject_hosting = true
 reject_tor = true
-reject_proxy = true
+reject_compromised = true
 reject_residential_proxy = true
 reject_country_mismatch = true
-max_proxycheck_risk = 25
+reject_hosting = false
+reject_proxy = false
+max_proxycheck_risk = 100
 max_preferred_tcp_fail_streak = 2
 ```
 

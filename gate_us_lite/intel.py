@@ -5,10 +5,10 @@ import re
 import urllib.parse
 from .http import fetch
 
-INTEL_SCHEMA = 4
+INTEL_SCHEMA = 5
 
 ABUSE_HOSTING_USAGE = "Data Center/Web Hosting/Transit"
-PROXYCHECK_FLAGS = ("tor", "hosting", "anonymous")
+PROXYCHECK_FLAGS = ("tor", "hosting", "anonymous", "compromised")
 
 HOSTING_WORDS = {
     "amazon", "aws", "google cloud", "microsoft", "azure", "digitalocean", "vultr", "linode",
@@ -73,6 +73,7 @@ def _proxycheck(ip: str, key: str, timeout: int, retries: int = 0, lookback_days
     services = (record.get("operator") or {}).get("services") or []
     return {
         "tor": detections["tor"],
+        "compromised": detections["compromised"],
         "hosting": detections["hosting"] or (record.get("network") or {}).get("type") == "Hosting",
         "proxycheck_proxy": detections["anonymous"],
         "proxycheck_risk": risk,

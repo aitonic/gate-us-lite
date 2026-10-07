@@ -89,6 +89,16 @@ class TestProbeTunnels(unittest.TestCase):
         self.assertIn("make OpenVPN handshake", failed[candidates[3].dedupe_key])
         self.assertEqual(captured["config"].count("type: openvpn"), 4)
 
+    def test_failures_of_one_kind_do_not_differ_by_node_address(self):
+        log_text = "\n".join(
+            f'time="2026-10-07T08:15:50+08:00" level=warning msg="[TCP] dial probe-{i} 127.0.0.1:6237{i} --> '
+            f'www.cloudflare.com:443 error: connect OpenVPN server: dial tcp 192.0.2.{i + 1}:995: i/o timeout"'
+            for i in range(2)
+        )
+        _, (alive, failed), _ = self.run_probe([RuntimeError("closed")] * 2, log_text, count=2)
+        self.assertEqual(alive, {})
+        self.assertEqual(set(failed.values()), {"connect OpenVPN server: dial tcp <addr>: i/o timeout"})
+
     def test_private_or_missing_exit_address_is_a_failure(self):
         candidates, (alive, failed), _ = self.run_probe([{"ip": "10.0.0.2"}, {}], count=2)
         self.assertEqual(alive, {})

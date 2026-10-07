@@ -57,21 +57,24 @@ source_low_watermark_ratio = 0.40
 source_low_watermark_min_baseline = 4
 
 [filters]
-# Better no node than a risky one: the checks below reject a node from Preferred and
-# Fallback alike. Tor, proxy, residential-proxy and risk verdicts only come from
-# ProxyCheck, so require_known_intel makes PROXYCHECK_API_KEY effectively mandatory:
-# an exit address without a verdict counts as unknown, never as clean, and is not
-# published.
+# Every node is a public relay, and ProxyCheck flagged every public relay in the sample
+# taken so far as a VPN/proxy host, so "hosting", "known proxy/VPN" and the risk score
+# cannot tell relays apart; they only lower a node's rank. The checks below do separate
+# them and reject a node from Preferred and Fallback alike. The Tor, compromised-host and residential-proxy
+# verdicts only come from ProxyCheck, so require_known_intel makes PROXYCHECK_API_KEY
+# effectively mandatory: an exit address without a verdict counts as unknown, never as
+# clean, and is not published.
 require_known_intel = true
-reject_hosting = true
 reject_tor = true
-# ProxyCheck's "anonymous" detection covers known proxies and VPNs.
-reject_proxy = true
+reject_compromised = true
 reject_residential_proxy = true
 reject_country_mismatch = true
-# ProxyCheck risk score (0-100); its documented "allow" band for addresses that are
-# not anonymous is 0-25.
-max_proxycheck_risk = 25
+reject_hosting = false
+# ProxyCheck's "anonymous" detection covers known proxies and VPNs.
+reject_proxy = false
+# ProxyCheck risk score (0-100). Its base scores follow the detection type (proxy and
+# compromised score 100), so any limit below 100 rejects every known relay.
+max_proxycheck_risk = 100
 max_ping_ms = 250
 min_speed_mbps = 0.5
 min_preferred_availability_24h = 0.25

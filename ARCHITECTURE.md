@@ -38,7 +38,7 @@ source priority + family evidence]
 real OpenVPN handshake + exit IP]
   TUNNEL --> VERDICTS[(verdicts.json, untrusted)]
   VERDICTS --> INTEL[publish job: IP intelligence
-known-clean / rejected / unknown]
+accepted / rejected / unknown]
   POOL --> INTEL
   INTEL --> SELECT[Selection
 hard rejects for both tiers
@@ -84,7 +84,7 @@ source_cache
 
 1. **Mirror provenance is not independent evidence.** Independent evidence is counted by normalized `evidence_families`, not the number of provenance labels.
 2. **Merge order is deterministic.** Concurrent source completion order cannot decide the canonical profile.
-3. **Unknown intelligence is not clean intelligence, and risk is never published.** Both ipwho and ProxyCheck must answer for the observed exit address (`require_known_intel`), and a ProxyCheck reply with a missing or null verdict is an error, not a clean result. Tor, proxy/VPN, residential-proxy and risk verdicts come from ProxyCheck (asked to remember detections for `proxycheck_lookback_days`); hosting and Tor can additionally be flagged by AbuseIPDB, and hosting by the ISP keyword heuristic. Unknown, hosting, proxy, Tor, residential-proxy, non-US, high-risk (`max_proxycheck_risk`) and severely abused addresses are hard rejects for Preferred and Fallback alike. Only ping, speed, availability and TCP-failure gates distinguish Preferred from Fallback.
+3. **Unknown intelligence is not clean intelligence, and danger is never published.** Both ipwho and ProxyCheck must answer for the observed exit address (`require_known_intel`), and a ProxyCheck reply with a missing or null verdict is an error, not a clean result. Tor, compromised-host, proxy/VPN, residential-proxy and risk verdicts come from ProxyCheck (asked to remember detections for `proxycheck_lookback_days`); hosting and Tor can additionally be flagged by AbuseIPDB, and hosting by the ISP keyword heuristic. Unknown, Tor, compromised, residential-proxy, non-US and severely abused addresses are hard rejects for Preferred and Fallback alike. Hosting, proxy/VPN and risk-score verdicts only lower the rank by default, because ProxyCheck gives them to every public relay; `reject_hosting`, `reject_proxy` and `max_proxycheck_risk` turn them into hard rejects. Only ping, speed, availability and TCP-failure gates distinguish Preferred from Fallback.
 4. **Source failure does not reduce endpoint availability.** Error, empty, degraded and skipped source runs are not valid denominator opportunities.
 5. **Cached recovery is generation-only evidence.** It prevents empty output, but does not improve historical availability.
 6. **Source fan-out is bounded.** Secondary profile downloads are capped by candidate count and a short per-profile timeout.

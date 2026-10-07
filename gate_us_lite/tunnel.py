@@ -18,6 +18,7 @@ from .models import Candidate
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 READY_TIMEOUT_SECONDS = 10.0
 DIAL_ERROR = re.compile(r'dial (probe-\d+) \S+ --> \S+ error: (.+?)"?$', re.M)
+ADDRESS = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b")
 
 
 class TunnelProbeUnavailable(RuntimeError):
@@ -53,7 +54,8 @@ def probe_tunnels(candidates: list[Candidate], mihomo_bin: str, timeout: float) 
         if exit_ip:
             alive[c.dedupe_key] = exit_ip
         else:
-            failed[c.dedupe_key] = dial_errors.get(f"probe-{index}") or error
+            # Masked addresses let the same kind of failure add up across nodes in the log summary.
+            failed[c.dedupe_key] = ADDRESS.sub("<addr>", dial_errors.get(f"probe-{index}") or error)
     return alive, failed
 
 
